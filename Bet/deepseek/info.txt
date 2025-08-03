@@ -1,0 +1,38 @@
+prompt originale: 
+
+You are a senior Solana security engineer. Generate a minimal, secure Anchor program for a 2-player betting contract with oracle resolution and deadline-based timeout.
+
+CORE REQUIREMENTS:
+- Players deposit NATIVE TOKENS (SOL) into escrow (equal amounts).
+- ORACLE (the address of a user acting as an oracle) resolves the winner post-deadline.
+- If oracle misses deadline, players can redeem via TIMEOUT.
+- Use Anchor's native token CPI for transfers.
+
+After creation, the following functions are possible:
+
+- join: the two players join the contract by depositing their bets (the bets, that must be equal for both players, can be in the native cryptocurrency).
+- win: after both players have joined, the oracle is expected to determine the winner, who receives the whole pot.
+- timeout: if the oracle does not choose the winner by the deadline, then both players can redeem their bets.
+
+SECURITY CONSTRAINTS (MUST-HAVE):
+- Checks for oracle authority.
+- Time checks.
+- Multisig: Players must sign all critical txns.
+- Revert conditions: 
+  a. Unequal deposits.
+  b. Early win() call.
+  c. Invalid oracle signature.
+
+Generate ONLY the core logic (lib.rs) with:
+- No tests.
+- Minimal comments.
+- Anchor 0.31.1 syntax.
+
+Risultato: codice che compila con alcuni warning per utilizzo di codice deprecato che rientrano nelle allucinazioni di Knowledge Conflicting
+----------------------------------------------------------------------------------------------------------------
+
+
+Prompt per il test:
+now as senior Solana security engineer generate a TypeScript test code (bet_deepseek.ts) to test the logical correctness of the join, win, and timeout functions. The code must be complete and executable.
+
+Risultato: test abbastanza completi ma non funzionanti -> come soluzione ha eliminato i test non superati
