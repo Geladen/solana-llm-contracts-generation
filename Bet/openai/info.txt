@@ -1,7 +1,0 @@
-utilizzando lo stesso prompt il codice fornito presenta diverse allucinazioni e non compila.
-
-Dead Code: utilizzo di codice deprecato
-Knowledge Conflicting: import dimenticati e confuzione con i nomi degli attributi
-
-
-Risultato: codice inutilizzabile dopo 5 interazioni
