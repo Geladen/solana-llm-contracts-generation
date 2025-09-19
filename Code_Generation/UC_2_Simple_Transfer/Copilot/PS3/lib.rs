@@ -1,6 +1,7 @@
-#![allow(unexpected_cfgs)]
 use anchor_lang::prelude::*;
-use anchor_lang::system_program;
+use anchor_lang::system_program;                  // for Transfer & transfer()
+use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::solana_program::system_instruction;
 
 declare_id!("DLykriTeJXQ73Vr1DxTUAvm5AfQVFHAkFHvMy3ay3VWy");
 
@@ -8,150 +9,196 @@ declare_id!("DLykriTeJXQ73Vr1DxTUAvm5AfQVFHAkFHvMy3ay3VWy");
 pub mod simple_copilot {
     use super::*;
 
-    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        // 1) Reject zero
-        if amount == 0 {
-            return Err(ErrorCode::InvalidAmount.into());
+    /// Deposit lamports into the PDA. If it’s brand‐new, CPI‐create it (rent+deposit) + init state.
+    pub fn deposit(ctx: Context<DepositCtx>, amount_to_deposit: u64) -> Result<()> {
+        let sender     = &ctx.accounts.sender;
+        let recipient  = &ctx.accounts.recipient;
+        let pda_info   = &ctx.accounts.balance_holder_pda.to_account_info();
+        let system     = &ctx.accounts.system_program;
+        let rent       = &ctx.accounts.rent;
+        let program_id = ctx.program_id; // &Pubkey
+
+        // Disallow zero
+        require!(amount_to_deposit > 0, ErrorCode::InvalidAmount);
+
+        // Seeds & bump
+        let bump     = ctx.bumps.balance_holder_pda;
+        let rec_key  = recipient.key();
+        let send_key = sender.key();
+        let bump_arr = [bump];
+        let seeds: &[&[u8]] = &[
+            rec_key.as_ref(),
+            send_key.as_ref(),
+            bump_arr.as_ref(),
+        ];
+
+        // Rent‐exempt lamports + space
+        let space         = 8 + 32 + 32 + 8;
+        let rent_lamports = rent.minimum_balance(space);
+
+        if pda_info.owner != program_id {
+            // FIRST deposit: create account with rent+deposit in one CPI
+            let lamports_to_allocate = rent_lamports
+                .checked_add(amount_to_deposit)
+                .unwrap();
+
+            let ix = system_instruction::create_account(
+                &send_key,
+                &pda_info.key(),
+                lamports_to_allocate,
+                space as u64,
+                &program_id,
+            );
+            invoke_signed(
+                &ix,
+                &[
+                    sender.to_account_info(),
+                    pda_info.clone(),
+                    system.to_account_info(),
+                ],
+                &[seeds],
+            )?;
+
+            // Now write initial state
+            let mut data = pda_info.try_borrow_mut_data()?;
+            let state = BalanceHolderPDA {
+                sender:    send_key,
+                recipient: rec_key,
+                amount:    amount_to_deposit,
+            };
+            state.try_serialize(&mut *data)?;
+        } else {
+            // TOP‐UP: just transfer then bump on‐chain state
+            let cpi_ctx = CpiContext::new(
+                system.to_account_info(),
+                system_program::Transfer {
+                    from: sender.to_account_info(),
+                    to:   pda_info.clone(),
+                },
+            );
+            system_program::transfer(cpi_ctx, amount_to_deposit)?;
+
+            let mut data = pda_info.try_borrow_mut_data()?;
+            let mut slice: &[u8] = &*data;
+            let mut slice_ref: &mut &[u8] = &mut slice;
+            let mut state = BalanceHolderPDA::try_deserialize(&mut slice_ref)?;
+            require_keys_eq!(state.sender,    send_key, ErrorCode::InvalidPDAData);
+            require_keys_eq!(state.recipient, rec_key,  ErrorCode::InvalidPDAData);
+            state.amount = state
+                .amount
+                .checked_add(amount_to_deposit)
+                .ok_or(error!(ErrorCode::Overflow))?;
+            state.try_serialize(&mut *data)?;
         }
-
-        // 2) Initialize the PDA’s state
-        let pda = &mut ctx.accounts.balance_holder_pda;
-        pda.sender = ctx.accounts.sender.key();
-        pda.recipient = ctx.accounts.recipient.key();
-        pda.amount = amount;
-
-        // 3) Transfer lamports from sender → PDA (on top of the rent‐exempt balance)
-        let cpi = CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            anchor_lang::system_program::Transfer {
-                from: ctx.accounts.sender.to_account_info(),
-                to: pda.to_account_info(),
-            },
-        );
-        anchor_lang::system_program::transfer(cpi, amount)?;
 
         Ok(())
     }
 
-    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
-        // 1) Reject zero
-        if amount == 0 {
-            return Err(ErrorCode::InvalidAmount.into());
-        }
+    /// Withdraw lamports by hand‐moving lamports from the PDA → recipient.
+    /// Anchor will auto‐close the PDA (rent → sender) once `amount` hits zero.
+    pub fn withdraw(ctx: Context<WithdrawCtx>, amount_to_withdraw: u64) -> Result<()> {
+    // 1) Pull out AccountInfos up front (no borrows of the `Account<...>` remain)
+    let recipient_info = ctx.accounts.recipient.to_account_info();
+    let sender_info    = ctx.accounts.sender.to_account_info();
+    let pda_info       = ctx.accounts.balance_holder_pda.to_account_info();
 
-        let pda = &mut ctx.accounts.balance_holder_pda;
+    // 2) Now get a mutable reference to the PDA state
+    let vault = &mut ctx.accounts.balance_holder_pda;
 
-        // 2) Only the designated recipient may withdraw
-        if ctx.accounts.recipient.key() != pda.recipient {
-            return Err(ErrorCode::InvalidRecipient.into());
-        }
+    // 3) State‐based guards
+    require!(amount_to_withdraw > 0, ErrorCode::InvalidAmount);
+    require!(vault.amount >= amount_to_withdraw, ErrorCode::InsufficientFunds);
 
-        // 3) Must have enough funds
-        if amount > pda.amount {
-            return Err(ErrorCode::InsufficientFunds.into());
-        }
+    // 4) Update the on‐chain `amount`
+    vault.amount = vault.amount.checked_sub(amount_to_withdraw).unwrap();
 
-        // 4) Move lamports out
-        **pda.to_account_info().try_borrow_mut_lamports()? -= amount;
-        **ctx
-            .accounts
-            .recipient
-            .to_account_info()
-            .try_borrow_mut_lamports()? += amount;
+    // 5) Move lamports: debit PDA, credit recipient
+    **recipient_info.lamports.borrow_mut() += amount_to_withdraw;
+    **pda_info.lamports.borrow_mut()       -= amount_to_withdraw;
 
-        // 5) Update on‐chain state; when `amount == 0`, `close = sender` fires automatically
-        pda.amount = pda.amount.checked_sub(amount).unwrap();
-        Ok(())
+    // 6) If fully drained, refund the remaining rent reserve back to sender
+    if vault.amount == 0 {
+        let remaining = **pda_info.lamports.borrow();
+        **sender_info.lamports.borrow_mut() += remaining;
+        **pda_info.lamports.borrow_mut() = 0;
     }
+
+    Ok(())
+}
+
+
 }
 
 //
-// Deposit Context
+// ACCOUNTS
 //
-#[derive(Accounts)]
-pub struct Deposit<'info> {
-    /// PDA storing (sender, recipient, amount)
-    /// - init:   create it now (rent‐exempt lamports from `sender`)
-    /// - payer:  `sender`
-    /// - seeds:  [recipient, sender]
-    /// - bump:   auto‐derived
-    /// - space:  8 (disc) + 32 + 32 + 8
-    #[account(
-        init,
-        payer = sender,
-        seeds = [recipient.key().as_ref(), sender.key().as_ref()],
-        bump,
-        space = 8 + 32 + 32 + 8
-    )]
-    pub balance_holder_pda: Account<'info, BalanceHolderPda>,
 
-    /// The wallet that funds rent + deposit, must sign.
+#[derive(Accounts)]
+pub struct DepositCtx<'info> {
     #[account(mut)]
     pub sender: Signer<'info>,
 
-    /// The future recipient’s Pubkey (only used for PDA seeds).
-    /// CHECK: no data is ever read from or written to this account.
+    /// CHECK: only used as a seed, no data read or written
     pub recipient: UncheckedAccount<'info>,
 
-    /// System program for CPI.
-    pub system_program: Program<'info, System>,
-
-    /// Rent sysvar for Anchor’s `init` under the hood.
-    pub rent: Sysvar<'info, Rent>,
-}
-
-//
-// Withdraw Context
-//
-#[derive(Accounts)]
-pub struct Withdraw<'info> {
-    /// The designated recipient withdrawing funds, must sign.
-    #[account(mut)]
-    pub recipient: Signer<'info>,
-
-    /// The original sender Pubkey (used for PDA seeds and rent refund on close).
-    /// CHECK: no data is ever read from or written to this account.
-    pub sender: UncheckedAccount<'info>,
-
-    /// PDA must:
-    /// - exist with the same seeds & bump  
-    /// - `has_one = recipient` and `has_one = sender` guard fields  
-    /// - `close = sender` when drained
+    /// CHECK: PDA is manually created via CPI in `deposit`
     #[account(
         mut,
         seeds = [recipient.key().as_ref(), sender.key().as_ref()],
         bump,
-        has_one = recipient,
-        has_one = sender,
-        close = sender
     )]
-    pub balance_holder_pda: Account<'info, BalanceHolderPda>,
+    pub balance_holder_pda: UncheckedAccount<'info>,
 
-    /// System program for the underlying close CPI.
+    pub system_program: Program<'info, System>,
+    pub rent:           Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawCtx<'info> {
+    #[account(mut)]
+    pub recipient: Signer<'info>,
+
+    /// CHECK: only used for seed derivation & `has_one` validation
+    /// We mark it `mut` so the PDA can refund rent to it on close.
+    #[account(mut)]
+    pub sender: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [recipient.key().as_ref(), sender.key().as_ref()],
+        bump,
+        has_one = sender,
+        has_one = recipient
+    )]
+    pub balance_holder_pda: Account<'info, BalanceHolderPDA>,
+
     pub system_program: Program<'info, System>,
 }
 
 //
-// PDA State
+// STATE & ERRORS
 //
+
 #[account]
-pub struct BalanceHolderPda {
+#[derive(Default)]
+pub struct BalanceHolderPDA {
     pub sender:    Pubkey,
     pub recipient: Pubkey,
     pub amount:    u64,
 }
 
-//
-// Errors
-//
 #[error_code]
 pub enum ErrorCode {
     #[msg("Amount must be greater than zero")]
     InvalidAmount,
 
-    #[msg("Caller is not the designated recipient")]
-    InvalidRecipient,
-
-    #[msg("Insufficient funds in PDA")]
+    #[msg("Insufficient funds available for withdrawal")]
     InsufficientFunds,
+
+    #[msg("PDA state does not match provided sender/recipient")]
+    InvalidPDAData,
+
+    #[msg("Overflow in balance calculation")]
+    Overflow,
 }
+

@@ -1,82 +1,90 @@
-You are an expert Solana smart contract developer specializing in Anchor framework. Your task is to create a complete, secure, and efficient Anchor smart contract implementing a two-party betting system with the following strict specifications:
-Core Requirements:
-1. Simultaneous Participation:
-   * Both players must join the bet in the same transaction
-   * The join function must require both participants' signatures
-2. Signature Requirements:
-   * join: Requires signatures from both participant1 and participant2
-   * win: Requires signature from the designated oracle
-   * timeout: Requires signature from either participant
-3. Account Restrictions:
-   * Only explicitly defined accounts in the contexts may be used
-   * Any usage of undeclared accounts should be rejected
-   * Strictly use these accounts:
-	For join instruction:
-		-participant1 (signer, mutable)
-		-participant2 (signer, mutable)
-		-oracle (reference, for storage)
-		-bet_info (PDA, to be initialized)
-		-system_program (program)
-	For win instruction:	
-		-oracle (signer)
-		-winner (winner account, mutable)
-		-bet_info (PDA, mutable)
-		-participant1 (reference, for PDA derivation)
-		-participant2 (reference, for PDA derivation)
-		-system_program (program)
-	For timeout instruction:
-		-participant1 (mutable)
-		-participant2 (mutable)
-		-bet_info (PDA, mutable)
-		-system_program (program)
-      All PDAs must use seeds structured exactly as:
-      seeds = [participant1.key().as_ref(), participant2.key().as_ref()]
-4. State Management:
-   * Enforce that both participants have deposited before any resolution
-5. Security Constraints:
-   * Prevent front-running with proper state checks
-   * Ensure all transfers are atomic within the same transaction
-   * Include comprehensive error checks for all operations
-Function Specifications:
-1. join(ctx: Context<JoinCtx>, delay: u64, wager: u64) -> Result<()>
-   * Must be called by both participants in same transaction
-   * Transfers equal wagers from both participants to PDA
-   * Sets deadline as current slot + delay
-2. win(ctx: Context<WinCtx>) -> Result<()>
-   * Only callable by pre-designated oracle
-   * Transfers entire pot to winner
-   * Marks bet as resolved
-3. timeout(ctx: Context<TimeoutCtx>) -> Result<()>
-   * Only callable after deadline
-   * Returns original wagers to participants
-   * Marks bet as resolved
-Validation Requirements:
-* Reject transactions where:
-   * Not all required parties have signed
-   * The oracle is invalid
-   * The deadline hasn't been reached (for timeout)
-   * The deadline has passed (for win)
-   * The bet is already resolved
-Example Scenarios:
-1: Successful join scenario
-   -Input: participant1 and participant2 call join with wager=100000000 (in lamports, e.g., 0.1 SOL) and delay=1000 slots.
-   -Output: Funds are transferred from both participants' accounts to the PDA account (bet_info). The PDA is initialized with oracle, participant1, participant2, wager=100000000, and deadline=current_slot + 1000.
-2: Successful win scenario
-   -Input: The designated oracle calls win before the deadline, with winner set to participant1.
-   -Output: The entire pot (200000000 lamports) is transferred from the PDA account to the winner's account (participant1). The PDA account's lamports are set to zero.
-3: Successful timeout scenario
-   -Input: After the deadline, participant1 calls timeout.
-   -Output: The original wagers (100000000 lamports each) are returned to participant1 and participant2. The PDA account's lamports are set to zero.
-4: Error scenario - Invalid oracle
-   -Input: An account other than the designated oracle calls win.
-   -Output: The transaction is reverted with an "InvalidOracle" error.
-5: Error scenario - Deadline not reached
-   -Input: A participant calls timeout before the deadline.
-   -Output: The transaction is reverted with a "DeadlineNotReached" error.
+1. Persona Tecnique + Overview
+Purpose: To set the context and expertise level, ensuring the AI adopts the correct role and understands the project's scope.
+How to do it: Start by defining the AI's role and the primary objective.
 
+```
+You are an expert Solana smart contract developer specializing in the Anchor framework. Your task is to create a complete, secure, and efficient Anchor smart contract for a [describe system purpose] with the following strict specifications:
+```
+2. Core Requirements + Signature
+Purpose: To unambiguously define the security model by specifying which actors must authorize each action. This is critical for preventing unauthorized access and to ensure compatibility with tests.
+
+```
+[Instruction Name]: Requires signatures from [list of signers]
+[Instruction Name]: Requires signature from [signer]
+[Instruction Name]: Requires signature from [either signer A or signer B]
+```
+
+3. Account + Seed Specification 
+Purpose: To ensure compatibility with tests and client-side code. By explicitly declaring all accounts, and exact PDA seeds, you guarantee the generated code will derive the same addresses as your tests expect.
+
+```
+Account Restrictions:
+
+For [Struct Name] structure:
+-account_name (signer)
+-another_account (PDA)
+-system_program (program, reference)
+
+For [Another Structure] structure:
+-account_name (signer)
+-pda_account (PDA)
+-reference_account (reference)
+
+All PDAs must use seeds structured exactly as:
+seeds = [first_account.key().as_ref(), second_account.key().as_ref()]
+```
+
+4. Function Signature Technique
+Purpose: To ensure compatibility with tests and force the general logic of the smart contract, its instructions, its parameters.
+How to do it: For each function, specify its Context, parameters, and the key actions it must perform.
+
+```
+
+function_name(ctx: Context<ContextName>, param: u64) -> Result<()>
+-Must [key requirement]
+-Transfers [amount] from [account] to [account]
+
+```
+
+5. Additional Constraints 
+Purpose: Additional constraints can be added if necessary.
+
+```
+Reject transactions where:
+-A required state condition is not met (e.g., deadline not reached)
+-The state is already finalized (e.g., already resolved)
+```
+
+6. Adapted Few-shot Technique
+Purpose: To provide behavioral examples that test both the "happy path" (successful operations) and edge cases (error conditions). This helps the AI understand the desired input/output behavior concretely.
+How to do it: Provide 4-5 short scenarios. Typically, use 3 positive examples and 2 negative examples.
+
+```
+Example Scenarios:
+1: Successful [Action] scenario
+Input: [Accounts and parameters used]
+Output: [State change and transfers that occur]
+
+...
+
+5: Error scenario - [Error Type]
+Input: [Invalid accounts or parameters]
+Output: Transaction is reverted with an "[ErrorName]" error.
+```
+
+7. List of Packages Technique
+Purpose: To limit the scope of the AI's knowledge to specific crates and versions, ensuring the code is generated with the correct syntax and available methods.
+How to do it: Explicitly state which crates and modules the contract can use.
+
+```
 The smart contract has access to the following packages:
-   * anchor_lang::prelude::*
-   * anchor_lang::system_program
-   
-Let's think step by step to construct the complete code based on the description.
-The contract must use only the explicitly declared accounts and follow Anchor best practices for security and efficiency. Include all necessary account validations and state checks to prevent invalid operations.
+anchor_lang::prelude::*
+anchor_spl::token::*
+```
+
+8. Chain-of-Thought Technique
+Purpose: To prime the AI to generate a more thoughtful and complete solution by encouraging a logical construction process rather than a rushed output.
+
+```
+Let's think step by step to construct the complete code based on the description. 
+```

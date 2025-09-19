@@ -2,9 +2,9 @@
 
 | Metric                          | Value     |
 |---------------------------------|-----------|
-| **Lines of Code**               | 150       |
-| **Comments per Line**           | 8         |
-| **Declared Functions**          | 2         |
-| **Lines per deposit function**  | 30        |
-| **Lines per withdraw function** | 50        |
+| **Lines of Code**               |        |
+| **Comments per Line**           |          |
+| **Declared Functions**          |          |
+| **Lines per deposit function**  |         |
+| **Lines per withdraw function** |         |
 
