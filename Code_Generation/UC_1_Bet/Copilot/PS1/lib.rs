@@ -10,106 +10,106 @@ pub mod bet_program {
 
     /// Both participants call this in the same transaction to place equal wagers.
     pub fn join(
-    ctx: Context<JoinCtx>,
-    delay: u64,
-    wager: u64,
-) -> Result<()> {
-    let bet = &mut ctx.accounts.bet_info;
-    bet.participant1 = *ctx.accounts.participant1.key;
-    bet.participant2 = *ctx.accounts.participant2.key;
-    bet.oracle       = *ctx.accounts.oracle.key;
-    let clock        = Clock::get()?;
-    bet.deadline     = clock.slot.checked_add(delay).unwrap();
-    bet.wager        = wager;
-    // ← direct field lookup instead of `ctx.bumps.get()`
-    bet.bump         = ctx.bumps.bet_info;
+        ctx: Context<JoinCtx>,
+        delay: u64,
+        wager: u64,
+    ) -> Result<()> {
+        let bet = &mut ctx.accounts.bet_info;
+        bet.participant1 = *ctx.accounts.participant1.key;
+        bet.participant2 = *ctx.accounts.participant2.key;
+        bet.oracle       = *ctx.accounts.oracle.key;
+        let clock        = Clock::get()?;
+        bet.deadline     = clock.slot.checked_add(delay).unwrap();
+        bet.wager        = wager;
+        // ← direct field lookup instead of `ctx.bumps.get()`
+        bet.bump         = ctx.bumps.bet_info;
 
-    // transfer from participant1
-    anchor_lang::system_program::transfer(
-        CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.participant1.to_account_info(),
-                to:   ctx.accounts.bet_info.to_account_info(),
-            },
-        ),
-        wager,
-    )?;
+        // transfer from participant1
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.participant1.to_account_info(),
+                    to:   ctx.accounts.bet_info.to_account_info(),
+                },
+            ),
+            wager,
+        )?;
 
-    // transfer from participant2
-    anchor_lang::system_program::transfer(
-        CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.participant2.to_account_info(),
-                to:   ctx.accounts.bet_info.to_account_info(),
-            },
-        ),
-        wager,
-    )?;
+        // transfer from participant2
+        anchor_lang::system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.participant2.to_account_info(),
+                    to:   ctx.accounts.bet_info.to_account_info(),
+                },
+            ),
+            wager,
+        )?;
 
-    Ok(())
-}
+        Ok(())
+    }
 
     /// Oracle declares the winner before the deadline.
     pub fn win(ctx: Context<WinCtx>) -> Result<()> {
-    let mut bet_info_ai     = ctx.accounts.bet_info.to_account_info();
-    let mut winner_ai       = ctx.accounts.winner.to_account_info();
+        let mut bet_info_ai     = ctx.accounts.bet_info.to_account_info();
+        let mut winner_ai       = ctx.accounts.winner.to_account_info();
 
-    // now that we have the AIs, borrow the state mutably
-    let bet = &mut ctx.accounts.bet_info;
+        // now that we have the AIs, borrow the state mutably
+        let bet = &mut ctx.accounts.bet_info;
 
-    require!(bet.wager > 0, ErrorCode::AlreadySettled);
-    let clock = Clock::get()?;
-    require!(clock.slot <= bet.deadline, ErrorCode::TooLateForWin);
+        require!(bet.wager > 0, ErrorCode::AlreadySettled);
+        let clock = Clock::get()?;
+        require!(clock.slot <= bet.deadline, ErrorCode::TooLateForWin);
 
-    let wkey = ctx.accounts.winner.key();
-    require!(
-        wkey == bet.participant1 || wkey == bet.participant2,
-        ErrorCode::InvalidWinner
-    );
+        let wkey = ctx.accounts.winner.key();
+        require!(
+            wkey == bet.participant1 || wkey == bet.participant2,
+            ErrorCode::InvalidWinner
+        );
 
-    let pot = bet.wager.checked_mul(2).unwrap();
+        let pot = bet.wager.checked_mul(2).unwrap();
 
-    // manual lamport move
-    **bet_info_ai.try_borrow_mut_lamports()? -= pot;
-    **winner_ai.try_borrow_mut_lamports()?  += pot;
+        // manual lamport move
+        **bet_info_ai.try_borrow_mut_lamports()? -= pot;
+        **winner_ai.try_borrow_mut_lamports()?  += pot;
 
-    bet.wager = 0;
-    Ok(())
-}
+        bet.wager = 0;
+        Ok(())
+    }
 
     /// After deadline, either participant can refund their wager.
     pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
-    let mut bet_info_ai  = ctx.accounts.bet_info.to_account_info();
-    let mut p1_ai        = ctx.accounts.participant1.to_account_info();
-    let mut p2_ai        = ctx.accounts.participant2.to_account_info();
+        let mut bet_info_ai  = ctx.accounts.bet_info.to_account_info();
+        let mut p1_ai        = ctx.accounts.participant1.to_account_info();
+        let mut p2_ai        = ctx.accounts.participant2.to_account_info();
 
-    let bet = &mut ctx.accounts.bet_info;
-    require!(bet.wager > 0, ErrorCode::AlreadySettled);
+        let bet = &mut ctx.accounts.bet_info;
+        require!(bet.wager > 0, ErrorCode::AlreadySettled);
 
-    let clock = Clock::get()?;
-    require!(clock.slot > bet.deadline, ErrorCode::TooEarlyForTimeout);
+        let clock = Clock::get()?;
+        require!(clock.slot > bet.deadline, ErrorCode::TooEarlyForTimeout);
 
-    require!(
-        ctx.accounts.participant1.is_signer
-        || ctx.accounts.participant2.is_signer,
-        ErrorCode::Unauthorized
-    );
+        require!(
+            ctx.accounts.participant1.is_signer
+            || ctx.accounts.participant2.is_signer,
+            ErrorCode::Unauthorized
+        );
 
-    let w = bet.wager;
+        let w = bet.wager;
 
-    // refund participant1
-    **bet_info_ai.try_borrow_mut_lamports()? -= w;
-    **p1_ai.try_borrow_mut_lamports()?       += w;
+        // refund participant1
+        **bet_info_ai.try_borrow_mut_lamports()? -= w;
+        **p1_ai.try_borrow_mut_lamports()?       += w;
 
-    // refund participant2
-    **bet_info_ai.try_borrow_mut_lamports()? -= w;
-    **p2_ai.try_borrow_mut_lamports()?       += w;
+        // refund participant2
+        **bet_info_ai.try_borrow_mut_lamports()? -= w;
+        **p2_ai.try_borrow_mut_lamports()?       += w;
 
-    bet.wager = 0;
-    Ok(())
-}
+        bet.wager = 0;
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]

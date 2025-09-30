@@ -8,60 +8,57 @@ pub mod bet_openai {
     use super::*;
 
     pub fn join(ctx: Context<JoinCtx>, delay: u64, wager: u64) -> Result<()> {
-    require!(wager > 0, BetError::InvalidWager);
+        require!(wager > 0, BetError::InvalidWager);
 
-    let p1 = ctx.accounts.participant1.key();
-    let p2 = ctx.accounts.participant2.key();
+        let p1 = ctx.accounts.participant1.key();
+        let p2 = ctx.accounts.participant2.key();
 
-    let (smaller, larger) = if p1 < p2 { (p1, p2) } else { (p2, p1) };
+        let (smaller, larger) = if p1 < p2 { (p1, p2) } else { (p2, p1) };
 
-    let bet_info = &mut ctx.accounts.bet_info;
-    bet_info.participant1 = smaller;
-    bet_info.participant2 = larger;
-    bet_info.oracle = ctx.accounts.oracle.key();
-    bet_info.wager = wager;
-    bet_info.deadline = Clock::get()?.slot + delay;
-    bet_info.bump = ctx.bumps.bet_info;
+        let bet_info = &mut ctx.accounts.bet_info;
+        bet_info.participant1 = smaller;
+        bet_info.participant2 = larger;
+        bet_info.oracle = ctx.accounts.oracle.key();
+        bet_info.wager = wager;
+        bet_info.deadline = Clock::get()?.slot + delay;
+        bet_info.bump = ctx.bumps.bet_info;
 
-    // ✅ Transfer wagers safely via CPI
-    let ix1 = anchor_lang::system_program::Transfer {
-        from: ctx.accounts.participant1.to_account_info(),
-        to: ctx.accounts.bet_info.to_account_info(),
-    };
-    let cpi_ctx1 = CpiContext::new(ctx.accounts.system_program.to_account_info(), ix1);
-    system_program::transfer(cpi_ctx1, wager)?;
+        // ✅ Transfer wagers safely via CPI
+        let ix1 = anchor_lang::system_program::Transfer {
+            from: ctx.accounts.participant1.to_account_info(),
+            to: ctx.accounts.bet_info.to_account_info(),
+        };
+        let cpi_ctx1 = CpiContext::new(ctx.accounts.system_program.to_account_info(), ix1);
+        system_program::transfer(cpi_ctx1, wager)?;
 
-    let ix2 = anchor_lang::system_program::Transfer {
-        from: ctx.accounts.participant2.to_account_info(),
-        to: ctx.accounts.bet_info.to_account_info(),
-    };
-    let cpi_ctx2 = CpiContext::new(ctx.accounts.system_program.to_account_info(), ix2);
-    system_program::transfer(cpi_ctx2, wager)?;
+        let ix2 = anchor_lang::system_program::Transfer {
+            from: ctx.accounts.participant2.to_account_info(),
+            to: ctx.accounts.bet_info.to_account_info(),
+        };
+        let cpi_ctx2 = CpiContext::new(ctx.accounts.system_program.to_account_info(), ix2);
+        system_program::transfer(cpi_ctx2, wager)?;
 
-    Ok(())
-}
+        Ok(())
+    }
 
+    pub fn win(ctx: Context<WinCtx>) -> Result<()> {
+        let bet_info = &mut ctx.accounts.bet_info;
 
+        // ✅ Ensure winner is a participant
+        require!(
+            ctx.accounts.winner.key() == ctx.accounts.participant1.key()
+                || ctx.accounts.winner.key() == ctx.accounts.participant2.key(),
+            BetError::InvalidWinner
+        );
 
-pub fn win(ctx: Context<WinCtx>) -> Result<()> {
-    let bet_info = &mut ctx.accounts.bet_info;
+        let pot = bet_info.wager * 2;
 
-    // ✅ Ensure winner is a participant
-    require!(
-        ctx.accounts.winner.key() == ctx.accounts.participant1.key()
-            || ctx.accounts.winner.key() == ctx.accounts.participant2.key(),
-        BetError::InvalidWinner
-    );
+        // ✅ Manual lamport transfer from PDA (bet_info) to winner
+        **ctx.accounts.bet_info.to_account_info().try_borrow_mut_lamports()? -= pot;
+        **ctx.accounts.winner.to_account_info().try_borrow_mut_lamports()? += pot;
 
-    let pot = bet_info.wager * 2;
-
-    // ✅ Manual lamport transfer from PDA (bet_info) to winner
-    **ctx.accounts.bet_info.to_account_info().try_borrow_mut_lamports()? -= pot;
-    **ctx.accounts.winner.to_account_info().try_borrow_mut_lamports()? += pot;
-
-    Ok(())
-}
-
+        Ok(())
+    }
 
     pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
         let bet_info = &ctx.accounts.bet_info;
