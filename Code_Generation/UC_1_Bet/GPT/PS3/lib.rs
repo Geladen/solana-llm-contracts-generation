@@ -55,111 +55,111 @@ pub mod two_player_bet {
     }
 
     pub fn win(ctx: Context<WinCtx>) -> Result<()> {
-    let p1 = ctx.accounts.participant1.key();
-    let p2 = ctx.accounts.participant2.key();
-    let wager = ctx.accounts.bet_info.wager;
-    let bump = ctx.accounts.bet_info.bump;
-    let deadline = ctx.accounts.bet_info.deadline;
-    let settled = ctx.accounts.bet_info.settled;
+        let p1 = ctx.accounts.participant1.key();
+        let p2 = ctx.accounts.participant2.key();
+        let wager = ctx.accounts.bet_info.wager;
+        let bump = ctx.accounts.bet_info.bump;
+        let deadline = ctx.accounts.bet_info.deadline;
+        let settled = ctx.accounts.bet_info.settled;
 
-    require!(!settled, BetError::AlreadySettled);
-    let now = Clock::get()?.slot;
-    require!(now <= deadline, BetError::DeadlinePassed);
+        require!(!settled, BetError::AlreadySettled);
+        let now = Clock::get()?.slot;
+        require!(now <= deadline, BetError::DeadlinePassed);
 
-    let winner_key = ctx.accounts.winner.key();
-    require!(winner_key == p1 || winner_key == p2, BetError::InvalidWinner);
+        let winner_key = ctx.accounts.winner.key();
+        require!(winner_key == p1 || winner_key == p2, BetError::InvalidWinner);
 
-    let pot = wager.checked_mul(2).ok_or(BetError::MathOverflow)?;
-    require!(
-        ctx.accounts.bet_info.to_account_info().lamports() >= pot,
-        BetError::InsufficientPot
-    );
+        let pot = wager.checked_mul(2).ok_or(BetError::MathOverflow)?;
+        require!(
+            ctx.accounts.bet_info.to_account_info().lamports() >= pot,
+            BetError::InsufficientPot
+        );
 
-    // --- Transfer pot to winner ---
-    {
-        let from = &mut ctx.accounts.bet_info.to_account_info();
-        let to = &mut ctx.accounts.winner.to_account_info();
+        // --- Transfer pot to winner ---
+        {
+            let from = &mut ctx.accounts.bet_info.to_account_info();
+            let to = &mut ctx.accounts.winner.to_account_info();
 
-        **from.try_borrow_mut_lamports()? -= pot;
-        **to.try_borrow_mut_lamports()? += pot;
-    }
-
-    // --- Drain remainder (rent, etc.) to participant1 ---
-    {
-        let from = &mut ctx.accounts.bet_info.to_account_info();
-        let to = &mut ctx.accounts.participant1.to_account_info();
-        let remainder = from.lamports();
-
-        if remainder > 0 {
-            **from.try_borrow_mut_lamports()? -= remainder;
-            **to.try_borrow_mut_lamports()? += remainder;
+            **from.try_borrow_mut_lamports()? -= pot;
+            **to.try_borrow_mut_lamports()? += pot;
         }
-    }
 
-    let bet = &mut ctx.accounts.bet_info;
-    bet.settled = true;
-    bet.wager = 0;
-
-    Ok(())
-}
-
-pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
-    let p1 = ctx.accounts.participant1.key();
-    let p2 = ctx.accounts.participant2.key();
-    let wager = ctx.accounts.bet_info.wager;
-    let deadline = ctx.accounts.bet_info.deadline;
-    let settled = ctx.accounts.bet_info.settled;
-
-    require!(
-        ctx.accounts.participant1.to_account_info().is_signer
-            || ctx.accounts.participant2.to_account_info().is_signer,
-        BetError::Unauthorized
-    );
-    require!(!settled, BetError::AlreadySettled);
-
-    let now = Clock::get()?.slot;
-    require!(now >= deadline, BetError::DeadlineNotReached);
-
-    let pot_needed = wager.checked_mul(2).ok_or(BetError::MathOverflow)?;
-    require!(
-        ctx.accounts.bet_info.to_account_info().lamports() >= pot_needed,
-        BetError::InsufficientPot
-    );
-
-    // --- Refund wagers ---
-    if wager > 0 {
+        // --- Drain remainder (rent, etc.) to participant1 ---
         {
             let from = &mut ctx.accounts.bet_info.to_account_info();
             let to = &mut ctx.accounts.participant1.to_account_info();
-            **from.try_borrow_mut_lamports()? -= wager;
-            **to.try_borrow_mut_lamports()? += wager;
+            let remainder = from.lamports();
+
+            if remainder > 0 {
+                **from.try_borrow_mut_lamports()? -= remainder;
+                **to.try_borrow_mut_lamports()? += remainder;
+            }
         }
+
+        let bet = &mut ctx.accounts.bet_info;
+        bet.settled = true;
+        bet.wager = 0;
+
+        Ok(())
+    }
+
+    pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
+        let p1 = ctx.accounts.participant1.key();
+        let p2 = ctx.accounts.participant2.key();
+        let wager = ctx.accounts.bet_info.wager;
+        let deadline = ctx.accounts.bet_info.deadline;
+        let settled = ctx.accounts.bet_info.settled;
+
+        require!(
+            ctx.accounts.participant1.to_account_info().is_signer
+                || ctx.accounts.participant2.to_account_info().is_signer,
+            BetError::Unauthorized
+        );
+        require!(!settled, BetError::AlreadySettled);
+
+        let now = Clock::get()?.slot;
+        require!(now >= deadline, BetError::DeadlineNotReached);
+
+        let pot_needed = wager.checked_mul(2).ok_or(BetError::MathOverflow)?;
+        require!(
+            ctx.accounts.bet_info.to_account_info().lamports() >= pot_needed,
+            BetError::InsufficientPot
+        );
+
+        // --- Refund wagers ---
+        if wager > 0 {
+            {
+                let from = &mut ctx.accounts.bet_info.to_account_info();
+                let to = &mut ctx.accounts.participant1.to_account_info();
+                **from.try_borrow_mut_lamports()? -= wager;
+                **to.try_borrow_mut_lamports()? += wager;
+            }
+            {
+                let from = &mut ctx.accounts.bet_info.to_account_info();
+                let to = &mut ctx.accounts.participant2.to_account_info();
+                **from.try_borrow_mut_lamports()? -= wager;
+                **to.try_borrow_mut_lamports()? += wager;
+            }
+        }
+
+        // --- Drain remainder (rent) to participant1 ---
         {
             let from = &mut ctx.accounts.bet_info.to_account_info();
-            let to = &mut ctx.accounts.participant2.to_account_info();
-            **from.try_borrow_mut_lamports()? -= wager;
-            **to.try_borrow_mut_lamports()? += wager;
+            let to = &mut ctx.accounts.participant1.to_account_info();
+            let remainder = from.lamports();
+
+            if remainder > 0 {
+                **from.try_borrow_mut_lamports()? -= remainder;
+                **to.try_borrow_mut_lamports()? += remainder;
+            }
         }
+
+        let bet = &mut ctx.accounts.bet_info;
+        bet.settled = true;
+        bet.wager = 0;
+
+        Ok(())
     }
-
-    // --- Drain remainder (rent) to participant1 ---
-    {
-        let from = &mut ctx.accounts.bet_info.to_account_info();
-        let to = &mut ctx.accounts.participant1.to_account_info();
-        let remainder = from.lamports();
-
-        if remainder > 0 {
-            **from.try_borrow_mut_lamports()? -= remainder;
-            **to.try_borrow_mut_lamports()? += remainder;
-        }
-    }
-
-    let bet = &mut ctx.accounts.bet_info;
-    bet.settled = true;
-    bet.wager = 0;
-
-    Ok(())
-}
 
 }
 

@@ -50,6 +50,13 @@ pub mod betting_system {
             BetError::UnauthorizedOracle
         );
         
+        // Validate that winner is one of the participants
+        require!(
+            ctx.accounts.winner.key() == bet_info.participant1 || 
+            ctx.accounts.winner.key() == bet_info.participant2,
+            BetError::WinnerNotParticipant
+        );
+        
         // Get the total amount in the PDA
         let amount = ctx.accounts.bet_info.to_account_info().lamports();
         
@@ -123,7 +130,7 @@ pub struct WinCtx<'info> {
     #[account(mut)]
     pub oracle: Signer<'info>,
     #[account(mut)]
-    /// CHECK: Winner account validated by oracle
+    /// CHECK: Winner account validated by oracle and must be one of the participants
     pub winner: AccountInfo<'info>,
     #[account(
         mut,
@@ -174,4 +181,6 @@ pub enum BetError {
     UnauthorizedOracle,
     #[msg("Unauthorized access")]
     Unauthorized,
+    #[msg("Winner must be one of the participants")]
+    WinnerNotParticipant,
 }

@@ -11,49 +11,47 @@ pub mod betting {
     /// - delay: number of slots to add to current slot to form deadline
     /// - wager: lamports each participant will deposit
     pub fn join(ctx: Context<JoinCtx>, delay: u64, wager: u64) -> Result<()> {
-    require!(wager > 0, ErrorCode::InvalidWager);
+        require!(wager > 0, ErrorCode::InvalidWager);
 
-    let bet_info = &mut ctx.accounts.bet_info;
+        let bet_info = &mut ctx.accounts.bet_info;
 
-    // store participants, oracle, wager, deadline
-    bet_info.participant1 = ctx.accounts.participant1.key();
-    bet_info.participant2 = ctx.accounts.participant2.key();
-    bet_info.oracle = ctx.accounts.oracle.key();
-    bet_info.wager = wager;
+        // store participants, oracle, wager, deadline
+        bet_info.participant1 = ctx.accounts.participant1.key();
+        bet_info.participant2 = ctx.accounts.participant2.key();
+        bet_info.oracle = ctx.accounts.oracle.key();
+        bet_info.wager = wager;
 
-    let clock = Clock::get()?;
-    bet_info.deadline = clock
-        .slot
-        .checked_add(delay)
-        .ok_or(ErrorCode::NumericOverflow)?;
-    bet_info.settled = false;
+        let clock = Clock::get()?;
+        bet_info.deadline = clock
+            .slot
+            .checked_add(delay)
+            .ok_or(ErrorCode::NumericOverflow)?;
+        bet_info.settled = false;
 
-    // Transfer wagers
-    system_program::transfer(
-        CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            system_program::Transfer {
-                from: ctx.accounts.participant1.to_account_info(),
-                to: ctx.accounts.bet_info.to_account_info(),
-            },
-        ),
-        wager,
-    )?;
-    system_program::transfer(
-        CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            system_program::Transfer {
-                from: ctx.accounts.participant2.to_account_info(),
-                to: ctx.accounts.bet_info.to_account_info(),
-            },
-        ),
-        wager,
-    )?;
+        // Transfer wagers
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.participant1.to_account_info(),
+                    to: ctx.accounts.bet_info.to_account_info(),
+                },
+            ),
+            wager,
+        )?;
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.participant2.to_account_info(),
+                    to: ctx.accounts.bet_info.to_account_info(),
+                },
+            ),
+            wager,
+        )?;
 
-    Ok(())
-}
-
-
+        Ok(())
+    }
 
     /// win: only callable by the oracle signer.
     /// Transfers the entire pot to `winner` by closing the bet_info PDA to `winner`.
@@ -85,60 +83,58 @@ pub mod betting {
 
     /// timeout: callable by either participant after deadline.
     /// Returns each participant their original wager and closes the PDA.
-pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
-    // Extract immutable AccountInfos first
-    let bet_info_account = ctx.accounts.bet_info.to_account_info();
-    let participant1_account = ctx.accounts.participant1.to_account_info();
-    let participant2_account = ctx.accounts.participant2.to_account_info();
+    pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
+        // Extract immutable AccountInfos first
+        let bet_info_account = ctx.accounts.bet_info.to_account_info();
+        let participant1_account = ctx.accounts.participant1.to_account_info();
+        let participant2_account = ctx.accounts.participant2.to_account_info();
 
-    // PDA seeds for signing
-    let seeds: &[&[u8]] = &[
-        ctx.accounts.participant1.key.as_ref(),
-        ctx.accounts.participant2.key.as_ref(),
-    ];
-    let signer_seeds: &[&[&[u8]]] = &[seeds];
+        // PDA seeds for signing
+        let seeds: &[&[u8]] = &[
+            ctx.accounts.participant1.key.as_ref(),
+            ctx.accounts.participant2.key.as_ref(),
+        ];
+        let signer_seeds: &[&[&[u8]]] = &[seeds];
 
-    let bet_info = &mut ctx.accounts.bet_info;
+        let bet_info = &mut ctx.accounts.bet_info;
 
-    // validations
-    require!(
-        ctx.accounts.participant1.key() == bet_info.participant1 &&
-        ctx.accounts.participant2.key() == bet_info.participant2,
-        ErrorCode::InvalidParticipants
-    );
-    let clock = Clock::get()?;
-    require!(clock.slot > bet_info.deadline, ErrorCode::DeadlineNotReached);
-    require!(!bet_info.settled, ErrorCode::AlreadySettled);
+        // validations
+        require!(
+            ctx.accounts.participant1.key() == bet_info.participant1 &&
+            ctx.accounts.participant2.key() == bet_info.participant2,
+            ErrorCode::InvalidParticipants
+        );
+        let clock = Clock::get()?;
+        require!(clock.slot > bet_info.deadline, ErrorCode::DeadlineNotReached);
+        require!(!bet_info.settled, ErrorCode::AlreadySettled);
 
-    // Refund wagers
-    system_program::transfer(
-        CpiContext::new_with_signer(
-            ctx.accounts.system_program.to_account_info(),
-            system_program::Transfer {
-                from: bet_info_account.clone(),
-                to: participant1_account,
-            },
-            signer_seeds,
-        ),
-        bet_info.wager,
-    )?;
-    system_program::transfer(
-        CpiContext::new_with_signer(
-            ctx.accounts.system_program.to_account_info(),
-            system_program::Transfer {
-                from: bet_info_account,
-                to: participant2_account,
-            },
-            signer_seeds,
-        ),
-        bet_info.wager,
-    )?;
+        // Refund wagers
+        system_program::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: bet_info_account.clone(),
+                    to: participant1_account,
+                },
+                signer_seeds,
+            ),
+            bet_info.wager,
+        )?;
+        system_program::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: bet_info_account,
+                    to: participant2_account,
+                },
+                signer_seeds,
+            ),
+            bet_info.wager,
+        )?;
 
-    bet_info.settled = true;
-    Ok(())
-}
-
-
+        bet_info.settled = true;
+        Ok(())
+    }
 
 }
 

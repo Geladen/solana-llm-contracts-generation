@@ -53,40 +53,40 @@ pub mod solana_betting {
     /// Only the designated oracle may call.
     /// Transfers the full pot (2 * wager) to `winner`.
     pub fn win(ctx: Context<WinCtx>) -> Result<()> {
-    let bet = &ctx.accounts.bet_info;
+        let bet = &ctx.accounts.bet_info;
 
-    // 1) Only allow the stored oracle to call
-    //    (you already do this via the constraint on WinCtx)
+        // 1) Only allow the stored oracle to call
+        //    (you already do this via the constraint on WinCtx)
 
-    // 2) Ensure the `winner` is either participant1 or participant2
-    require!(
-        ctx.accounts.winner.key() == bet.participant1
-         || ctx.accounts.winner.key() == bet.participant2,
-        ErrorCode::InvalidWinner
-    );
+        // 2) Ensure the `winner` is either participant1 or participant2
+        require!(
+            ctx.accounts.winner.key() == bet.participant1
+            || ctx.accounts.winner.key() == bet.participant2,
+            ErrorCode::InvalidWinner
+        );
 
-    // 3) Re‐derive PDA and bump
-    let (pda, bump) = Pubkey::find_program_address(
-        &[
-            bet.participant1.as_ref(),
-            bet.participant2.as_ref(),
-        ],
-        ctx.program_id,
-    );
-    require_keys_eq!(pda, ctx.accounts.bet_info.key(), ErrorCode::InvalidPda);
+        // 3) Re‐derive PDA and bump
+        let (pda, bump) = Pubkey::find_program_address(
+            &[
+                bet.participant1.as_ref(),
+                bet.participant2.as_ref(),
+            ],
+            ctx.program_id,
+        );
+        require_keys_eq!(pda, ctx.accounts.bet_info.key(), ErrorCode::InvalidPda);
 
-    // 4) Compute full pot
-    let pot = bet.wager.checked_mul(2)
-        .ok_or(ErrorCode::CalculationOverflow)?;
+        // 4) Compute full pot
+        let pot = bet.wager.checked_mul(2)
+            .ok_or(ErrorCode::CalculationOverflow)?;
 
-    // 5) Move lamports out of PDA into `winner`
-    let bet_info_ai = &mut ctx.accounts.bet_info.to_account_info();
-    let winner_ai   = &mut ctx.accounts.winner;
-    **bet_info_ai.lamports.borrow_mut() -= pot;
-    **winner_ai.lamports.borrow_mut()   += pot;
+        // 5) Move lamports out of PDA into `winner`
+        let bet_info_ai = &mut ctx.accounts.bet_info.to_account_info();
+        let winner_ai   = &mut ctx.accounts.winner;
+        **bet_info_ai.lamports.borrow_mut() -= pot;
+        **winner_ai.lamports.borrow_mut()   += pot;
 
-    Ok(())
-}
+        Ok(())
+    }
 
 
     /// After `deadline`, either participant may call.
