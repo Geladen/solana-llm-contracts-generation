@@ -1,92 +1,112 @@
 use anchor_lang::prelude::*;
-use anchor_lang::system_program::{transfer, Transfer};
+use anchor_lang::system_program;
 
-declare_id!("FnyoFnQKzbfZsfnKEHB8NsF9o1eRC8nUhD3Km3d5fjye");
+declare_id!("Ac2UYENaE44h8j8F8YZnfw22rpqXTSdfHkHjrVy7KmZi");
 
 #[program]
-pub mod transfer_contract {
+pub mod simple_transfer {
     use super::*;
 
-    pub fn deposit(ctx: Context<Deposit>, amount_to_deposit: u64) -> Result<()> {
-        require!(amount_to_deposit > 0, TransferError::ZeroAmount);
+    pub fn deposit(ctx: Context<DepositCtx>, amount_to_deposit: u64) -> Result<()> {
+        // Validate amount is positive
+        require!(amount_to_deposit > 0, TransferError::InvalidAmount);
 
         let balance_holder = &mut ctx.accounts.balance_holder_pda;
         
-        // Check if we need to initialize the account
+        // If account is being initialized, set sender and recipient
         if balance_holder.amount == 0 {
-            // Initialize the account
             balance_holder.sender = ctx.accounts.sender.key();
             balance_holder.recipient = ctx.accounts.recipient.key();
-            balance_holder.amount = amount_to_deposit;
         } else {
-            // Verify the stored sender and recipient match the expected ones
+            // Verify the sender and recipient match the stored ones
             require!(
-                balance_holder.sender == ctx.accounts.sender.key() &&
-                balance_holder.recipient == ctx.accounts.recipient.key(),
-                TransferError::AccountMismatch
+                balance_holder.sender == ctx.accounts.sender.key(),
+                TransferError::SenderMismatch
             );
-            
-            // Update the balance
-            balance_holder.amount = balance_holder
-                .amount
-                .checked_add(amount_to_deposit)
-                .ok_or(TransferError::Overflow)?;
+            require!(
+                balance_holder.recipient == ctx.accounts.recipient.key(),
+                TransferError::RecipientMismatch
+            );
         }
 
+        // Update the balance
+        balance_holder.amount = balance_holder
+            .amount
+            .checked_add(amount_to_deposit)
+            .ok_or(TransferError::Overflow)?;
+
         // Transfer funds from sender to PDA
-        let cpi_ctx = CpiContext::new(
+        let cpi_context = CpiContext::new(
             ctx.accounts.system_program.to_account_info(),
-            Transfer {
+            system_program::Transfer {
                 from: ctx.accounts.sender.to_account_info(),
                 to: ctx.accounts.balance_holder_pda.to_account_info(),
             },
         );
+        system_program::transfer(cpi_context, amount_to_deposit)?;
 
-        transfer(cpi_ctx, amount_to_deposit)
+        Ok(())
     }
 
-    pub fn withdraw(ctx: Context<Withdraw>, amount_to_withdraw: u64) -> Result<()> {
-        require!(amount_to_withdraw > 0, TransferError::ZeroAmount);
+    pub fn withdraw(ctx: Context<WithdrawCtx>, amount_to_withdraw: u64) -> Result<()> {
+        // Validate amount is positive
+        require!(amount_to_withdraw > 0, TransferError::InvalidAmount);
+
+        let balance_holder = &mut ctx.accounts.balance_holder_pda;
+        
+        // Verify PDA matches the expected sender and recipient
         require!(
-            ctx.accounts.balance_holder_pda.amount >= amount_to_withdraw,
+            balance_holder.sender == ctx.accounts.sender.key(),
+            TransferError::SenderMismatch
+        );
+        require!(
+            balance_holder.recipient == ctx.accounts.recipient.key(),
+            TransferError::RecipientMismatch
+        );
+        
+        // Check sufficient balance
+        require!(
+            balance_holder.amount >= amount_to_withdraw,
             TransferError::InsufficientFunds
         );
 
-        let balance_holder = &mut ctx.accounts.balance_holder_pda;
-        balance_holder.amount = balance_holder
+        // Store the amount before updating for closure check
+        let new_amount = balance_holder
             .amount
             .checked_sub(amount_to_withdraw)
             .ok_or(TransferError::Underflow)?;
 
-        let should_close = balance_holder.amount == 0;
+        // Update balance
+        balance_holder.amount = new_amount;
 
-        // Transfer funds from PDA to recipient using direct lamport manipulation
+        // Get account info references before doing lamports manipulation
         let balance_holder_info = ctx.accounts.balance_holder_pda.to_account_info();
         let recipient_info = ctx.accounts.recipient.to_account_info();
-        
-        // Withdraw the requested amount
-        **balance_holder_info.try_borrow_mut_lamports()? = balance_holder_info
-            .lamports()
-            .checked_sub(amount_to_withdraw)
-            .ok_or(TransferError::Underflow)?;
 
+        // Get current lamports in PDA
+        let current_lamports = balance_holder_info.lamports();
+        let transfer_lamports = amount_to_withdraw.min(current_lamports);
+
+        // Transfer lamports from PDA to recipient
+        **balance_holder_info.try_borrow_mut_lamports()? = current_lamports
+            .checked_sub(transfer_lamports)
+            .ok_or(TransferError::InsufficientFunds)?;
         **recipient_info.try_borrow_mut_lamports()? = recipient_info
             .lamports()
-            .checked_add(amount_to_withdraw)
+            .checked_add(transfer_lamports)
             .ok_or(TransferError::Overflow)?;
 
-        // Close the account if balance is zero and transfer remaining lamports to sender
-        if should_close {
+        // Close PDA if balance reaches zero
+        if new_amount == 0 {
             let sender_info = ctx.accounts.sender.to_account_info();
             let remaining_lamports = balance_holder_info.lamports();
             
-            // Transfer remaining lamports back to sender
+            // Transfer remaining lamports (rent exemption) back to sender
+            **balance_holder_info.try_borrow_mut_lamports()? = 0;
             **sender_info.try_borrow_mut_lamports()? = sender_info
                 .lamports()
                 .checked_add(remaining_lamports)
                 .ok_or(TransferError::Overflow)?;
-                
-            **balance_holder_info.try_borrow_mut_lamports()? = 0;
         }
 
         Ok(())
@@ -94,44 +114,53 @@ pub mod transfer_contract {
 }
 
 #[derive(Accounts)]
-pub struct Deposit<'info> {
+pub struct DepositCtx<'info> {
+    /// CHECK: Verified through signer and PDA derivation
     #[account(mut)]
     pub sender: Signer<'info>,
-    /// CHECK: This account is only used for PDA derivation
+    
+    /// CHECK: Used only for PDA derivation
     pub recipient: AccountInfo<'info>,
+    
     #[account(
-        init,
+        init_if_needed,
         payer = sender,
-        space = 8 + 32 + 32 + 8,
+        space = BalanceHolderPDA::SIZE,
         seeds = [
-            recipient.key().as_ref(), 
+            recipient.key().as_ref(),
             sender.key().as_ref()
         ],
         bump
     )]
     pub balance_holder_pda: Account<'info, BalanceHolderPDA>,
+    
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct Withdraw<'info> {
+pub struct WithdrawCtx<'info> {
+    /// CHECK: Verified through signer and PDA validation
     #[account(mut)]
     pub recipient: Signer<'info>,
+    
+    /// CHECK: Used for PDA derivation and validation, made mutable for rent refund
     #[account(mut)]
-    /// CHECK: This account is used for PDA derivation and validation, and we refund rent to it
     pub sender: AccountInfo<'info>,
+    
     #[account(
         mut,
         seeds = [
-            recipient.key().as_ref(), 
+            recipient.key().as_ref(),
             sender.key().as_ref()
         ],
         bump,
-        has_one = sender,
-        has_one = recipient
+        constraint = balance_holder_pda.recipient == recipient.key() @ TransferError::RecipientMismatch,
+        constraint = balance_holder_pda.sender == sender.key() @ TransferError::SenderMismatch
     )]
     pub balance_holder_pda: Account<'info, BalanceHolderPDA>,
-    pub system_program: Program<'info, System>,
+    
+    /// CHECK: Required for potential account closure
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[account]
@@ -141,14 +170,23 @@ pub struct BalanceHolderPDA {
     pub amount: u64,
 }
 
+impl BalanceHolderPDA {
+    pub const SIZE: usize = 8 + // discriminator
+        32 + // sender
+        32 + // recipient
+        8;   // amount
+}
+
 #[error_code]
 pub enum TransferError {
     #[msg("Amount must be greater than zero")]
-    ZeroAmount,
-    #[msg("Insufficient funds in PDA")]
+    InvalidAmount,
+    #[msg("Insufficient funds in contract")]
     InsufficientFunds,
-    #[msg("Account validation mismatch")]
-    AccountMismatch,
+    #[msg("Sender does not match PDA record")]
+    SenderMismatch,
+    #[msg("Recipient does not match PDA record")]
+    RecipientMismatch,
     #[msg("Arithmetic overflow")]
     Overflow,
     #[msg("Arithmetic underflow")]

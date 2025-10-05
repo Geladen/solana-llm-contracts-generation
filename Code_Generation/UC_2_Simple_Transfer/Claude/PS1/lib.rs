@@ -1,128 +1,99 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::{transfer, Transfer};
 
-declare_id!("FcKTHyfuGjwjztkgQginLKsZGUsDachGbMNZFG9JXQLo");
+declare_id!("6QdsFpMVikLt37CgnMieWjwBtsUWrTHzznX1NckoR8di");
 
 #[program]
-pub mod transfer_contract {
+pub mod simple_transfer {
     use super::*;
 
-    /// Deposit funds into the contract (initial deposit that creates the PDA)
+    /// Deposit funds into the contract
     /// Can only be called by the sender/owner
+    /// Initializes or updates the PDA with sender, recipient, and amount
     pub fn deposit(ctx: Context<DepositCtx>, amount_to_deposit: u64) -> Result<()> {
-        // Validate amount is not zero
-        require!(amount_to_deposit > 0, ErrorCode::ZeroAmountNotAllowed);
-
-        // Get accounts
-        let sender = &mut ctx.accounts.sender;
-        let balance_holder_pda = &mut ctx.accounts.balance_holder_pda;
-        let system_program = &ctx.accounts.system_program;
+        require!(amount_to_deposit > 0, ErrorCode::ZeroAmount);
 
         // Transfer lamports from sender to PDA
-        let transfer_instruction = Transfer {
-            from: sender.to_account_info(),
-            to: balance_holder_pda.to_account_info(),
+        let transfer_accounts = Transfer {
+            from: ctx.accounts.sender.to_account_info(),
+            to: ctx.accounts.balance_holder_pda.to_account_info(),
         };
-
-        let cpi_ctx = CpiContext::new(
-            system_program.to_account_info(),
-            transfer_instruction,
+        let cpi_context = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            transfer_accounts,
         );
-
-        transfer(cpi_ctx, amount_to_deposit)?;
-
-        // Initialize PDA state (this is the first deposit)
-        balance_holder_pda.sender = sender.key();
-        balance_holder_pda.recipient = ctx.accounts.recipient.key();
-        balance_holder_pda.amount = amount_to_deposit;
-
-        msg!("Deposited {} lamports. Total balance: {}", amount_to_deposit, balance_holder_pda.amount);
-
-        Ok(())
-    }
-
-    /// Add more funds to an existing contract
-    /// Can only be called by the sender/owner
-    pub fn add_deposit(ctx: Context<AddDepositCtx>, amount_to_deposit: u64) -> Result<()> {
-        // Validate amount is not zero
-        require!(amount_to_deposit > 0, ErrorCode::ZeroAmountNotAllowed);
-
-        // Get accounts
-        let sender = &mut ctx.accounts.sender;
-        let balance_holder_pda = &mut ctx.accounts.balance_holder_pda;
-        let system_program = &ctx.accounts.system_program;
-
-        // Transfer lamports from sender to PDA
-        let transfer_instruction = Transfer {
-            from: sender.to_account_info(),
-            to: balance_holder_pda.to_account_info(),
-        };
-
-        let cpi_ctx = CpiContext::new(
-            system_program.to_account_info(),
-            transfer_instruction,
-        );
-
-        transfer(cpi_ctx, amount_to_deposit)?;
+        transfer(cpi_context, amount_to_deposit)?;
 
         // Update PDA state
-        balance_holder_pda.amount += amount_to_deposit;
+        let pda = &mut ctx.accounts.balance_holder_pda;
+        pda.sender = ctx.accounts.sender.key();
+        pda.recipient = ctx.accounts.recipient.key();
+        pda.amount = pda.amount.checked_add(amount_to_deposit)
+            .ok_or(ErrorCode::Overflow)?;
 
-        msg!("Added {} lamports. Total balance: {}", amount_to_deposit, balance_holder_pda.amount);
-
+        msg!("Deposited {} lamports. New balance: {}", amount_to_deposit, pda.amount);
         Ok(())
     }
 
     /// Withdraw funds from the contract
     /// Can only be called by the designated recipient
+    /// Closes PDA when balance reaches zero, returning remaining lamports to sender
     pub fn withdraw(ctx: Context<WithdrawCtx>, amount_to_withdraw: u64) -> Result<()> {
-        // Validate amount is not zero
-        require!(amount_to_withdraw > 0, ErrorCode::ZeroAmountNotAllowed);
+        require!(amount_to_withdraw > 0, ErrorCode::ZeroAmount);
 
-        let balance_holder_pda = &mut ctx.accounts.balance_holder_pda;
-        let recipient = &mut ctx.accounts.recipient;
-
-        // Validate sufficient balance
+        // Verify recipient matches stored recipient
         require!(
-            balance_holder_pda.amount >= amount_to_withdraw,
-            ErrorCode::InsufficientBalance
-        );
-
-        // Validate recipient matches the one stored in PDA
-        require!(
-            balance_holder_pda.recipient == recipient.key(),
+            ctx.accounts.balance_holder_pda.recipient == ctx.accounts.recipient.key(),
             ErrorCode::UnauthorizedRecipient
         );
 
-        // Validate sender matches the one stored in PDA
+        // Verify sender matches stored sender
         require!(
-            balance_holder_pda.sender == ctx.accounts.sender.key(),
+            ctx.accounts.balance_holder_pda.sender == ctx.accounts.sender.key(),
             ErrorCode::InvalidSender
         );
 
-        // Calculate remaining balance after withdrawal
-        let remaining_balance = balance_holder_pda.amount - amount_to_withdraw;
+        // Check sufficient balance
+        require!(
+            ctx.accounts.balance_holder_pda.amount >= amount_to_withdraw,
+            ErrorCode::InsufficientFunds
+        );
+
+        // Calculate new balance
+        let new_balance = ctx.accounts.balance_holder_pda.amount
+            .checked_sub(amount_to_withdraw)
+            .ok_or(ErrorCode::Underflow)?;
 
         // Transfer lamports from PDA to recipient
-        **balance_holder_pda.to_account_info().try_borrow_mut_lamports()? -= amount_to_withdraw;
-        **recipient.to_account_info().try_borrow_mut_lamports()? += amount_to_withdraw;
+        let pda_info = ctx.accounts.balance_holder_pda.to_account_info();
+        let recipient_info = ctx.accounts.recipient.to_account_info();
+        
+        **pda_info.try_borrow_mut_lamports()? = pda_info
+            .lamports()
+            .checked_sub(amount_to_withdraw)
+            .ok_or(ErrorCode::InsufficientFunds)?;
+        
+        **recipient_info.try_borrow_mut_lamports()? = recipient_info
+            .lamports()
+            .checked_add(amount_to_withdraw)
+            .ok_or(ErrorCode::Overflow)?;
 
-        // Update PDA state
-        balance_holder_pda.amount = remaining_balance;
-
-        msg!("Withdrawn {} lamports. Remaining balance: {}", amount_to_withdraw, remaining_balance);
-
-        // If balance reaches zero, close the account and return remaining lamports to sender
-        if remaining_balance == 0 {
-            let sender_info = &ctx.accounts.sender.to_account_info();
-            let pda_info = balance_holder_pda.to_account_info();
+        if new_balance == 0 {
+            // Close PDA account and return remaining lamports to sender
+            let remaining_lamports = pda_info.lamports();
+            let sender_info = ctx.accounts.sender.to_account_info();
             
-            // Transfer remaining lamports (rent) back to sender
-            let pda_lamports = pda_info.lamports();
             **pda_info.try_borrow_mut_lamports()? = 0;
-            **sender_info.try_borrow_mut_lamports()? += pda_lamports;
+            **sender_info.try_borrow_mut_lamports()? = sender_info
+                .lamports()
+                .checked_add(remaining_lamports)
+                .ok_or(ErrorCode::Overflow)?;
 
-            msg!("PDA closed. Returned {} lamports to sender", pda_lamports);
+            msg!("Withdrawn {} lamports. PDA closed, remaining lamports returned to sender.", amount_to_withdraw);
+        } else {
+            // Update balance
+            ctx.accounts.balance_holder_pda.amount = new_balance;
+            msg!("Withdrawn {} lamports. Remaining balance: {}", amount_to_withdraw, new_balance);
         }
 
         Ok(())
@@ -130,17 +101,18 @@ pub mod transfer_contract {
 }
 
 #[derive(Accounts)]
+#[instruction(amount_to_deposit: u64)]
 pub struct DepositCtx<'info> {
     #[account(mut)]
     pub sender: Signer<'info>,
     
-    /// CHECK: This account is used for PDA derivation and validation only
+    /// CHECK: Used only for PDA derivation
     pub recipient: AccountInfo<'info>,
     
     #[account(
-        init,
+        init_if_needed,
         payer = sender,
-        space = 8 + 32 + 32 + 8, // discriminator + sender + recipient + amount
+        space = 8 + BalanceHolderPDA::INIT_SPACE,
         seeds = [recipient.key().as_ref(), sender.key().as_ref()],
         bump
     )]
@@ -150,30 +122,12 @@ pub struct DepositCtx<'info> {
 }
 
 #[derive(Accounts)]
-pub struct AddDepositCtx<'info> {
-    #[account(mut)]
-    pub sender: Signer<'info>,
-    
-    /// CHECK: This account is used for PDA derivation and validation only
-    pub recipient: AccountInfo<'info>,
-    
-    #[account(
-        mut,
-        seeds = [recipient.key().as_ref(), sender.key().as_ref()],
-        bump,
-        constraint = balance_holder_pda.sender == sender.key() @ ErrorCode::InvalidSender
-    )]
-    pub balance_holder_pda: Account<'info, BalanceHolderPDA>,
-    
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
+#[instruction(amount_to_withdraw: u64)]
 pub struct WithdrawCtx<'info> {
     #[account(mut)]
     pub recipient: Signer<'info>,
     
-    /// CHECK: This account is used for PDA validation and receiving returned lamports
+    /// CHECK: Used for PDA derivation and validation
     #[account(mut)]
     pub sender: AccountInfo<'info>,
     
@@ -181,8 +135,8 @@ pub struct WithdrawCtx<'info> {
         mut,
         seeds = [recipient.key().as_ref(), sender.key().as_ref()],
         bump,
-        constraint = balance_holder_pda.recipient == recipient.key() @ ErrorCode::UnauthorizedRecipient,
-        constraint = balance_holder_pda.sender == sender.key() @ ErrorCode::InvalidSender
+        constraint = balance_holder_pda.sender == sender.key() @ ErrorCode::InvalidSender,
+        constraint = balance_holder_pda.recipient == recipient.key() @ ErrorCode::UnauthorizedRecipient
     )]
     pub balance_holder_pda: Account<'info, BalanceHolderPDA>,
     
@@ -190,6 +144,7 @@ pub struct WithdrawCtx<'info> {
 }
 
 #[account]
+#[derive(InitSpace)]
 pub struct BalanceHolderPDA {
     pub sender: Pubkey,
     pub recipient: Pubkey,
@@ -199,14 +154,15 @@ pub struct BalanceHolderPDA {
 #[error_code]
 pub enum ErrorCode {
     #[msg("Amount must be greater than zero")]
-    ZeroAmountNotAllowed,
-    
-    #[msg("Insufficient balance for withdrawal")]
-    InsufficientBalance,
-    
+    ZeroAmount,
+    #[msg("Insufficient funds in contract")]
+    InsufficientFunds,
     #[msg("Unauthorized recipient")]
     UnauthorizedRecipient,
-    
     #[msg("Invalid sender")]
     InvalidSender,
+    #[msg("Arithmetic overflow")]
+    Overflow,
+    #[msg("Arithmetic underflow")]
+    Underflow,
 }
