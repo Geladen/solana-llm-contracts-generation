@@ -20,7 +20,7 @@ pub mod crowdfund {
         require!(end_donate_slot > clock.slot, CrowdfundingError::InvalidEndSlot);
         require!(goal_in_lamports > 0, CrowdfundingError::InvalidGoalAmount);
 
-        let campaign = &mut ctx.accounts.campaign;
+        let campaign = &mut ctx.accounts.campaign_pda;
         campaign.campaign_owner = ctx.accounts.campaign_owner.key();
         campaign.campaign_name = campaign_name;
         campaign.end_donate_slot = end_donate_slot;
@@ -33,40 +33,39 @@ pub mod crowdfund {
 
     pub fn donate(
         ctx: Context<Donate>,
-        campaign_name: String,
+        _campaign_name: String,
         donated_lamports: u64,
     ) -> Result<()> {
-        // Validate campaign is still active
         let clock = Clock::get()?;
         require!(
-            clock.slot <= ctx.accounts.campaign.end_donate_slot,
+            clock.slot <= ctx.accounts.campaign_pda.end_donate_slot,
             CrowdfundingError::CampaignEnded
         );
         require!(donated_lamports > 0, CrowdfundingError::InvalidDonationAmount);
 
-        // Transfer lamports from donor to campaign PDA using CPI
+        // Transfer lamports from donor to campaign PDA
         let cpi_context = CpiContext::new(
             ctx.accounts.system_program.to_account_info(),
             system_program::Transfer {
                 from: ctx.accounts.donor.to_account_info(),
-                to: ctx.accounts.campaign.to_account_info(),
+                to: ctx.accounts.campaign_pda.to_account_info(),
             },
         );
         system_program::transfer(cpi_context, donated_lamports)?;
 
         // Update deposit and campaign totals
-        let deposit = &mut ctx.accounts.deposit;
+        let deposit = &mut ctx.accounts.deposit_pda;
         deposit.total_donated = deposit.total_donated.checked_add(donated_lamports).unwrap();
 
-        let campaign = &mut ctx.accounts.campaign;
+        let campaign = &mut ctx.accounts.campaign_pda;
         campaign.total_donated = campaign.total_donated.checked_add(donated_lamports).unwrap();
 
         msg!("Donated {} lamports", donated_lamports);
         Ok(())
     }
 
-    pub fn withdraw(ctx: Context<Withdraw>, campaign_name: String) -> Result<()> {
-        let campaign = &ctx.accounts.campaign;
+    pub fn withdraw(ctx: Context<Withdraw>, _campaign_name: String) -> Result<()> {
+        let campaign = &ctx.accounts.campaign_pda;
         let clock = Clock::get()?;
         
         require!(clock.slot > campaign.end_donate_slot, CrowdfundingError::CampaignActive);
@@ -91,8 +90,8 @@ pub mod crowdfund {
         Ok(())
     }
 
-    pub fn reclaim(ctx: Context<Reclaim>, campaign_name: String) -> Result<()> {
-        let campaign = &ctx.accounts.campaign;
+    pub fn reclaim(ctx: Context<Reclaim>, _campaign_name: String) -> Result<()> {
+        let campaign = &ctx.accounts.campaign_pda;
         let clock = Clock::get()?;
         
         require!(clock.slot > campaign.end_donate_slot, CrowdfundingError::CampaignActive);
@@ -101,7 +100,7 @@ pub mod crowdfund {
             CrowdfundingError::GoalReached
         );
 
-        let deposit = &ctx.accounts.deposit;
+        let deposit = &ctx.accounts.deposit_pda;
         require!(deposit.total_donated > 0, CrowdfundingError::NoDonationFound);
 
         let refund_amount = deposit.total_donated;
@@ -126,11 +125,11 @@ pub struct Initialize<'info> {
     #[account(
         init,
         payer = campaign_owner,
-        space = 8 + Campaign::LEN,
+        space = 8 + std::mem::size_of::<CampaignPDA>(),
         seeds = [campaign_name.as_bytes()],
         bump
     )]
-    pub campaign: Account<'info, Campaign>,
+    pub campaign_pda: Account<'info, CampaignPDA>,
     
     pub system_program: Program<'info, System>,
 }
@@ -146,16 +145,16 @@ pub struct Donate<'info> {
         seeds = [campaign_name.as_bytes()],
         bump
     )]
-    pub campaign: Account<'info, Campaign>,
+    pub campaign_pda: Account<'info, CampaignPDA>,
     
     #[account(
         init_if_needed,
         payer = donor,
-        space = 8 + Deposit::LEN,
+        space = 8 + std::mem::size_of::<DepositPDA>(),
         seeds = [b"deposit".as_ref(), campaign_name.as_bytes(), donor.key().as_ref()],
         bump
     )]
-    pub deposit: Account<'info, Deposit>,
+    pub deposit_pda: Account<'info, DepositPDA>,
     
     pub system_program: Program<'info, System>,
 }
@@ -172,7 +171,7 @@ pub struct Withdraw<'info> {
         bump,
         has_one = campaign_owner
     )]
-    pub campaign: Account<'info, Campaign>,
+    pub campaign_pda: Account<'info, CampaignPDA>,
 }
 
 #[derive(Accounts)]
@@ -186,7 +185,7 @@ pub struct Reclaim<'info> {
         seeds = [campaign_name.as_bytes()],
         bump
     )]
-    pub campaign: Account<'info, Campaign>,
+    pub campaign_pda: Account<'info, CampaignPDA>,
     
     #[account(
         mut,
@@ -194,11 +193,11 @@ pub struct Reclaim<'info> {
         bump,
         close = donor
     )]
-    pub deposit: Account<'info, Deposit>,
+    pub deposit_pda: Account<'info, DepositPDA>,
 }
 
 #[account]
-pub struct Campaign {
+pub struct CampaignPDA {
     pub campaign_owner: Pubkey,
     pub campaign_name: String,
     pub end_donate_slot: u64,
@@ -207,16 +206,8 @@ pub struct Campaign {
 }
 
 #[account]
-pub struct Deposit {
+pub struct DepositPDA {
     pub total_donated: u64,
-}
-
-impl Campaign {
-    pub const LEN: usize = 32 + 50 + 8 + 8 + 8;
-}
-
-impl Deposit {
-    pub const LEN: usize = 8;
 }
 
 #[error_code]

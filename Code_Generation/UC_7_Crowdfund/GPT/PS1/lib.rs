@@ -8,32 +8,26 @@ declare_id!("3W1YqaZSvYZDwRKgr8HGGSBJsfxPLaA4615KSaGZi66u");
 pub mod crowdfund {
     use super::*;
 
-    pub fn initialize(
-        ctx: Context<InitializeCtx>,
-        campaign_name: String,
-        end_donate_slot: u64,
-        goal_in_lamports: u64,
-    ) -> Result<()> {
-        // signer is campaign_owner (enforced by context)
-        let clock = Clock::get()?;
-        if end_donate_slot < clock.slot {
-            return err!(ErrorCode::EndSlotBeforeCurrent);
-        }
-        if campaign_name.len() == 0 || campaign_name.len() > CampaignPDA::MAX_NAME_LEN {
-            return err!(ErrorCode::InvalidCampaignNameLength);
-        }
-        if goal_in_lamports == 0 {
-            return err!(ErrorCode::InvalidGoalAmount);
-        }
+pub fn initialize(
+    ctx: Context<InitializeCtx>,
+    campaign_name: String,
+    end_donate_slot: u64,
+    goal_in_lamports: u64,
+) -> Result<()> {
+    let clock = Clock::get()?;
+    require!(end_donate_slot >= clock.slot, ErrorCode::EndSlotBeforeCurrent);
+    require!(!campaign_name.is_empty(), ErrorCode::InvalidCampaignNameLength);
+    require!(goal_in_lamports > 0, ErrorCode::InvalidGoalAmount);
 
-        let campaign = &mut ctx.accounts.campaign_pda;
-        campaign.campaign_name = campaign_name;
-        campaign.campaign_owner = ctx.accounts.campaign_owner.key();
-        campaign.end_donate_slot = end_donate_slot;
-        campaign.goal_in_lamports = goal_in_lamports;
+    let campaign = &mut ctx.accounts.campaign_pda;
+    campaign.campaign_name = campaign_name;
+    campaign.campaign_owner = ctx.accounts.campaign_owner.key();
+    campaign.end_donate_slot = end_donate_slot;
+    campaign.goal_in_lamports = goal_in_lamports;
 
-        Ok(())
-    }
+    Ok(())
+}
+
 
     pub fn donate(
         ctx: Context<DonateCtx>,
@@ -133,13 +127,10 @@ pub fn reclaim(ctx: Context<ReclaimCtx>, _campaign_name: String) -> Result<()> {
 #[derive(Accounts)]
 #[instruction(campaign_name: String)]
 pub struct InitializeCtx<'info> {
-    /// Campaign owner (signer)
     #[account(mut)]
     pub campaign_owner: Signer<'info>,
 
-    /// Campaign PDA account that holds state and funds.
-    /// - derived with seeds: [campaign_name.as_ref()]
-    /// - initialized here
+    // ✅ Anchor will create and fund the PDA with rent-exempt lamports
     #[account(
         init,
         payer = campaign_owner,
@@ -151,6 +142,7 @@ pub struct InitializeCtx<'info> {
 
     pub system_program: Program<'info, System>,
 }
+
 
 #[derive(Accounts)]
 #[instruction(_campaign_name: String)]
@@ -284,4 +276,6 @@ pub enum ErrorCode {
     NoDepositToReclaim,
     #[msg("Campaign has insufficient funds to fulfill reclaim")]
     InsufficientCampaignFunds,
+    #[msg("Invalid PDA derived for the campaign")]
+    InvalidPDA,
 }

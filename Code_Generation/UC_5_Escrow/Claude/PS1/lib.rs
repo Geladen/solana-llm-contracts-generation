@@ -3,7 +3,7 @@ use anchor_lang::prelude::*;
 declare_id!("5HW9RUa4vgexN3MqCG5aNYCwWBwAy8ut6UFjPZfiAHZz");
 
 #[program]
-pub mod escrow_contract {
+pub mod escrow {
     use super::*;
 
     pub fn initialize(
@@ -71,11 +71,7 @@ pub mod escrow_contract {
     }
 
     pub fn pay(ctx: Context<PayCtx>, _escrow_name: String) -> Result<()> {
-        // Get all account infos and needed data before any mutable operations
-        let escrow_account_info = ctx.accounts.escrow_info.to_account_info();
-        let seller_account_info = ctx.accounts.seller.to_account_info();
-        let escrow_balance = escrow_account_info.lamports();
-        let rent_exemption = Rent::get()?.minimum_balance(escrow_account_info.data_len());
+        // Get needed data before any mutable operations
         let buyer_key = ctx.accounts.escrow_info.buyer;
         let current_state = ctx.accounts.escrow_info.state.clone();
 
@@ -91,22 +87,24 @@ pub mod escrow_contract {
             EscrowError::UnauthorizedBuyer
         );
 
-        // Calculate transfer amount (excluding rent)
-        let transfer_amount = escrow_balance.saturating_sub(rent_exemption);
+        // Get escrow account balance - transfer everything to seller
+        let escrow_account_info = ctx.accounts.escrow_info.to_account_info();
+        let escrow_balance = escrow_account_info.lamports();
 
-        // Transfer funds from escrow PDA to seller using scoped lamport manipulation
+        // Transfer all funds from escrow PDA to seller (closing the account)
         {
+            let seller_account_info = ctx.accounts.seller.to_account_info();
             let mut escrow_lamports = escrow_account_info.try_borrow_mut_lamports()?;
             let mut seller_lamports = seller_account_info.try_borrow_mut_lamports()?;
-            **escrow_lamports -= transfer_amount;
-            **seller_lamports += transfer_amount;
+            **seller_lamports += escrow_balance;
+            **escrow_lamports = 0;
         }
 
         // Now update state after lamport operations complete
         let escrow_info = &mut ctx.accounts.escrow_info;
         escrow_info.state = State::Closed;
 
-        msg!("Payment of {} lamports transferred to seller", transfer_amount);
+        msg!("Payment of {} lamports transferred to seller", escrow_balance);
 
         Ok(())
     }
@@ -136,21 +134,20 @@ pub mod escrow_contract {
         let escrow_balance = escrow_account_info.lamports();
         let remaining_balance = escrow_balance - refund_amount;
         
-        // Perform all transfers in a single scope
+        // Perform all transfers - refund to buyer, rent to seller, close escrow
         {
             let mut escrow_lamports = escrow_account_info.try_borrow_mut_lamports()?;
             let mut buyer_lamports = buyer_account_info.try_borrow_mut_lamports()?;
             let mut seller_lamports = seller_account_info.try_borrow_mut_lamports()?;
             
             // Transfer deposited amount to buyer
-            **escrow_lamports -= refund_amount;
             **buyer_lamports += refund_amount;
             
-            // Transfer remaining balance (rent) to seller if any
-            if remaining_balance > 0 {
-                **escrow_lamports -= remaining_balance;
-                **seller_lamports += remaining_balance;
-            }
+            // Transfer remaining balance (rent) to seller
+            **seller_lamports += remaining_balance;
+            
+            // Close escrow account
+            **escrow_lamports = 0;
         }
 
         // Now update state after all lamport operations complete
@@ -211,8 +208,8 @@ pub struct DepositCtx<'info> {
 pub struct PayCtx<'info> {
     pub buyer: Signer<'info>,
     
-    #[account(mut)]
     /// CHECK: Validated against escrow_info.seller, receives payment
+    #[account(mut)]
     pub seller: AccountInfo<'info>,
     
     #[account(
@@ -227,10 +224,11 @@ pub struct PayCtx<'info> {
 #[derive(Accounts)]
 #[instruction(escrow_name: String)]
 pub struct RefundCtx<'info> {
+    #[account(mut)]
     pub seller: Signer<'info>,
     
-    #[account(mut)]
     /// CHECK: Validated against escrow_info.buyer, receives refund
+    #[account(mut)]
     pub buyer: AccountInfo<'info>,
     
     #[account(

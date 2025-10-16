@@ -3,5 +3,5 @@
 | Metric                          | Value     |
 |---------------------------------|-----------|
 | **Iterations to  compile**      | 1         |
-| **Iterations to pass all tests**| 3         |
+| **Iterations to pass all tests**| MAX       |
 

@@ -1,4 +1,3 @@
-
 use anchor_lang::prelude::*;
 use anchor_spl::{
     associated_token::AssociatedToken,
@@ -11,33 +10,19 @@ use anchor_spl::{
 
 declare_id!("FyPxqSXCggZdgi4DriTNmNVjAU5A8BYrwmZDQ1WAu3Xs");
 
+
 #[program]
 pub mod token_transfer {
     use super::*;
 
-    pub fn deposit(ctx: Context<DepositCtx>, amount: u64) -> Result<()> {
+    pub fn deposit(ctx: Context<DepositCtx>) -> Result<()> {
+        let amount = ctx.accounts.temp_ata.amount;
         require!(amount > 0, ErrorCode::InvalidAmount);
-        require!(
-            ctx.accounts.sender_ata.amount >= amount,
-            ErrorCode::InsufficientFunds
-        );
-
-        // Transfer tokens from sender's ATA to PDA-owned token account
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.sender_ata.to_account_info(),
-            to: ctx.accounts.temp_ata.to_account_info(),
-            authority: ctx.accounts.sender.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        
-        transfer(cpi_ctx, amount)?;
 
         // Store escrow information
         let deposit_info = &mut ctx.accounts.deposit_info;
         deposit_info.temp_ata = ctx.accounts.temp_ata.key();
         deposit_info.recipient = ctx.accounts.recipient.key();
-        deposit_info.amount = amount;
 
         msg!(
             "Deposit created: {} tokens escrowed from {} to {}",
@@ -124,16 +109,8 @@ pub struct DepositCtx<'info> {
     
     #[account(
         mut,
-        associated_token::mint = mint,
-        associated_token::authority = sender
-    )]
-    pub sender_ata: Account<'info, TokenAccount>,
-    
-    #[account(
-        init,
-        payer = sender,
         token::mint = mint,
-        token::authority = atas_holder_pda,
+        token::authority = sender
     )]
     pub temp_ata: Account<'info, TokenAccount>,
     
@@ -141,7 +118,7 @@ pub struct DepositCtx<'info> {
         init,
         payer = sender,
         space = DepositInfo::LEN,
-        seeds = [b"deposit_info", temp_ata.key().as_ref()],
+        seeds = [temp_ata.key().as_ref()],
         bump
     )]
     pub deposit_info: Account<'info, DepositInfo>,
@@ -177,15 +154,15 @@ pub struct WithdrawCtx<'info> {
     
     #[account(
         mut,
-        associated_token::mint = mint,
-        associated_token::authority = atas_holder_pda
+        token::mint = mint,
+        token::authority = atas_holder_pda
     )]
     pub temp_ata: Account<'info, TokenAccount>,
     
     #[account(
         mut,
         close = sender, // Send rent back to sender when closed
-        seeds = [b"deposit_info", temp_ata.key().as_ref()],
+        seeds = [temp_ata.key().as_ref()],
         bump
     )]
     pub deposit_info: Account<'info, DepositInfo>,
@@ -207,15 +184,13 @@ pub struct WithdrawCtx<'info> {
 #[account]
 pub struct DepositInfo {
     pub temp_ata: Pubkey,    // 32 bytes
-    pub recipient: Pubkey,   // 32 bytes  
-    pub amount: u64,         // 8 bytes
+    pub recipient: Pubkey,   // 32 bytes
 }
 
 impl DepositInfo {
     pub const LEN: usize = 8 + // discriminator
         32 + // temp_ata
-        32 + // recipient
-        8;   // amount
+        32;  // recipient
 }
 
 #[error_code]
