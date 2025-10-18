@@ -22,7 +22,7 @@ After creation, the contract supports the following actions:
 - Transaction revert
 - Key-value maps
 
-## Implementations
+## Implementation
 
 Previous bidders are not stored, the contract sends the currency back to the previous bidder in the same transaction in which the new bid is made. 
 

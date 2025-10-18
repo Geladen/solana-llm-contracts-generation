@@ -20,6 +20,3 @@ Once the deposit action has been performed, exactly one of the following actions
 - Native tokens
 - Transaction revert
 
-## Implementations
-
-a step has been added for initializing the data of the escrow (buyer, seller, amount, etc.).
