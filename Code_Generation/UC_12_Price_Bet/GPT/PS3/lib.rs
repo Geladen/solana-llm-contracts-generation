@@ -44,35 +44,34 @@ pub mod price_bet {
     /// Player joins a bet by sending exactly the matching wager to the bet PDA.
     /// Accounts: player (signer), owner (reference), bet_info (PDA).
     pub fn join(ctx: Context<JoinCtx>) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp as u64;
+        let now = Clock::get()?.unix_timestamp as u64;
 
-    // Borrow immutably first
-    if ctx.accounts.bet_info.player != Pubkey::default() {
-        return err!(ErrorCode::AlreadyJoined);
+        // Borrow immutably first
+        if ctx.accounts.bet_info.player != Pubkey::default() {
+            return err!(ErrorCode::AlreadyJoined);
+        }
+        if now > ctx.accounts.bet_info.deadline {
+            return err!(ErrorCode::BetExpired);
+        }
+
+        // Save wager amount
+        let wager = ctx.accounts.bet_info.wager;
+
+        // CPI transfer
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::Transfer {
+                from: ctx.accounts.player.to_account_info(),
+                to: ctx.accounts.bet_info.to_account_info(),
+            },
+        );
+        system_program::transfer(cpi_ctx, wager)?;
+
+        // Now mutate bet_info safely
+        ctx.accounts.bet_info.player = ctx.accounts.player.key();
+
+        Ok(())
     }
-    if now > ctx.accounts.bet_info.deadline {
-        return err!(ErrorCode::BetExpired);
-    }
-
-    // Save wager amount
-    let wager = ctx.accounts.bet_info.wager;
-
-    // CPI transfer
-    let cpi_ctx = CpiContext::new(
-        ctx.accounts.system_program.to_account_info(),
-        system_program::Transfer {
-            from: ctx.accounts.player.to_account_info(),
-            to: ctx.accounts.bet_info.to_account_info(),
-        },
-    );
-    system_program::transfer(cpi_ctx, wager)?;
-
-    // Now mutate bet_info safely
-    ctx.accounts.bet_info.player = ctx.accounts.player.key();
-
-    Ok(())
-}
-
 
     /// Called by the player to claim the pot if Pyth's current price meets the condition.
     /// This will close the bet PDA and transfer the entire pot to the player (because of `close = player` in the Accounts struct).
@@ -279,4 +278,3 @@ pub enum ErrorCode {
     #[msg("Integer overflow")]
     Overflow,
 }
-

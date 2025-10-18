@@ -1,11 +1,9 @@
 # Code Metrics Report
 
-| Metric                          | Value     |
-|---------------------------------|-----------|
-| **Lines of Code**               |        |
-| **Comments per Line**           |         |
-| **Declared Functions**          |          |
-| **Lines per deposit function**  |         |
-| **Lines per withdraw function** |         |
-
+| Metric                          | Value       |
+|---------------------------------|-------------|
+| **Lines of Code**               | 175         |
+| **Comments per Line**           | 0,08 - (14) |
+| **Declared Functions**          | 2           |
+| **Lines per function**          | 48,5        |
 

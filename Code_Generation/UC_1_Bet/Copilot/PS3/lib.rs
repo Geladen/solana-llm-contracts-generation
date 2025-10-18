@@ -249,4 +249,3 @@ pub enum ErrorCode {
     #[msg("Winner must be one of the participants")]
     InvalidWinner,
 }
-

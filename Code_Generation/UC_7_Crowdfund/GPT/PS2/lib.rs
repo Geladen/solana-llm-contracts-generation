@@ -60,64 +60,60 @@ pub mod crowdfund {
         Ok(())
     }
 
+    pub fn withdraw(ctx: Context<Withdraw>, _campaign_name: String) -> Result<()> {
+        let campaign_info = ctx.accounts.campaign_pda.to_account_info();
+        let owner_info = ctx.accounts.campaign_owner.to_account_info();
+        let campaign = &ctx.accounts.campaign_pda;
 
+        let balance = **campaign_info.lamports.borrow();
+        let rent_exempt_min = Rent::get()?.minimum_balance(CampaignPDA::LEN + 8);
 
-pub fn withdraw(ctx: Context<Withdraw>, _campaign_name: String) -> Result<()> {
-    let campaign_info = ctx.accounts.campaign_pda.to_account_info();
-    let owner_info = ctx.accounts.campaign_owner.to_account_info();
-    let campaign = &ctx.accounts.campaign_pda;
+        require!(balance >= campaign.goal_in_lamports, ErrorCode::GoalNotReached);
+        require!(balance > rent_exempt_min, ErrorCode::InsufficientFundsInCampaign);
 
-    let balance = **campaign_info.lamports.borrow();
-    let rent_exempt_min = Rent::get()?.minimum_balance(CampaignPDA::LEN + 8);
+        // Only withdraw excess above rent exemption
+        let withdrawable = balance
+            .checked_sub(rent_exempt_min)
+            .ok_or(ErrorCode::Overflow)?;
 
-    require!(balance >= campaign.goal_in_lamports, ErrorCode::GoalNotReached);
-    require!(balance > rent_exempt_min, ErrorCode::InsufficientFundsInCampaign);
+        let owner_balance = **owner_info.lamports.borrow();
+        **owner_info.lamports.borrow_mut() = owner_balance
+            .checked_add(withdrawable)
+            .ok_or(ErrorCode::Overflow)?;
+        **campaign_info.lamports.borrow_mut() = rent_exempt_min;
 
-    // Only withdraw excess above rent exemption
-    let withdrawable = balance
-        .checked_sub(rent_exempt_min)
-        .ok_or(ErrorCode::Overflow)?;
+        Ok(())
+    }
 
-    let owner_balance = **owner_info.lamports.borrow();
-    **owner_info.lamports.borrow_mut() = owner_balance
-        .checked_add(withdrawable)
-        .ok_or(ErrorCode::Overflow)?;
-    **campaign_info.lamports.borrow_mut() = rent_exempt_min;
+    pub fn reclaim(ctx: Context<Reclaim>, _campaign_name: String) -> Result<()> {
+        let campaign_info = ctx.accounts.campaign_pda.to_account_info();
+        let donor_info = ctx.accounts.donor.to_account_info();
+        let deposit = &ctx.accounts.deposit_pda;
+        let campaign = &ctx.accounts.campaign_pda;
 
-    Ok(())
-}
+        let campaign_balance = **campaign_info.lamports.borrow();
+        let rent_exempt_min = Rent::get()?.minimum_balance(CampaignPDA::LEN + 8);
 
+        require!(
+            campaign_balance < campaign.goal_in_lamports,
+            ErrorCode::GoalAlreadyReached
+        );
 
-pub fn reclaim(ctx: Context<Reclaim>, _campaign_name: String) -> Result<()> {
-    let campaign_info = ctx.accounts.campaign_pda.to_account_info();
-    let donor_info = ctx.accounts.donor.to_account_info();
-    let deposit = &ctx.accounts.deposit_pda;
-    let campaign = &ctx.accounts.campaign_pda;
+        let amount = deposit.total_donated;
+        require!(amount > 0, ErrorCode::NothingToReclaim);
+        require!(
+            campaign_balance.saturating_sub(rent_exempt_min) >= amount,
+            ErrorCode::InsufficientFundsInCampaign
+        );
 
-    let campaign_balance = **campaign_info.lamports.borrow();
-    let rent_exempt_min = Rent::get()?.minimum_balance(CampaignPDA::LEN + 8);
+        let donor_balance = **donor_info.lamports.borrow();
+        **donor_info.lamports.borrow_mut() = donor_balance
+            .checked_add(amount)
+            .ok_or(ErrorCode::Overflow)?;
+        **campaign_info.lamports.borrow_mut() = campaign_balance - amount;
 
-    require!(
-        campaign_balance < campaign.goal_in_lamports,
-        ErrorCode::GoalAlreadyReached
-    );
-
-    let amount = deposit.total_donated;
-    require!(amount > 0, ErrorCode::NothingToReclaim);
-    require!(
-        campaign_balance.saturating_sub(rent_exempt_min) >= amount,
-        ErrorCode::InsufficientFundsInCampaign
-    );
-
-    let donor_balance = **donor_info.lamports.borrow();
-    **donor_info.lamports.borrow_mut() = donor_balance
-        .checked_add(amount)
-        .ok_or(ErrorCode::Overflow)?;
-    **campaign_info.lamports.borrow_mut() = campaign_balance - amount;
-
-    Ok(())
-}
-
+        Ok(())
+    }
 }
 
 /* ========================= Accounts & State ========================= */

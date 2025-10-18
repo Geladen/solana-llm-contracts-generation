@@ -111,8 +111,6 @@ pub struct WithdrawCtx<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
-
-
 // Custom errors
 #[error_code]
 pub enum CustomError {

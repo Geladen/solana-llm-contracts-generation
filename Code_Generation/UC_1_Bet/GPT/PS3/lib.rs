@@ -262,5 +262,3 @@ pub enum BetError {
     #[msg("Unauthorized: either participant must sign.")]
     Unauthorized,
 }
-
-

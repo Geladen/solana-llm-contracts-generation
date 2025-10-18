@@ -45,65 +45,62 @@ pub mod vault {
     /// Owner creates a withdrawal request.
     /// - signer: owner
     /// - accounts: owner (signer), receiver (reference), vault_info (PDA)
-pub fn withdraw(ctx: Context<WithdrawCtx>, amount: u64) -> Result<()> {
-    // immutable borrow first
-    let vault_balance = ctx.accounts.vault_info.to_account_info().lamports();
+    pub fn withdraw(ctx: Context<WithdrawCtx>, amount: u64) -> Result<()> {
+        // immutable borrow first
+        let vault_balance = ctx.accounts.vault_info.to_account_info().lamports();
 
-    // now mutable borrow
-    let vault = &mut ctx.accounts.vault_info;
+        // now mutable borrow
+        let vault = &mut ctx.accounts.vault_info;
 
-    // checks
-    require!(ctx.accounts.owner.key() == vault.owner, VaultError::InvalidOwner);
-    require!(vault.state == State::Idle, VaultError::VaultNotIdle);
-    require!(amount > 0, VaultError::InvalidAmount);
-    require!((vault_balance as u64) >= amount, VaultError::InsufficientVaultFunds);
+        // checks
+        require!(ctx.accounts.owner.key() == vault.owner, VaultError::InvalidOwner);
+        require!(vault.state == State::Idle, VaultError::VaultNotIdle);
+        require!(amount > 0, VaultError::InvalidAmount);
+        require!((vault_balance as u64) >= amount, VaultError::InsufficientVaultFunds);
 
-    // mutate
-    vault.receiver = ctx.accounts.receiver.key();
-    vault.request_time = Clock::get()?.slot;
-;
-    vault.amount = amount;
-    vault.state = State::Req;
+        // mutate
+        vault.receiver = ctx.accounts.receiver.key();
+        vault.request_time = Clock::get()?.slot;
+    ;
+        vault.amount = amount;
+        vault.state = State::Req;
 
-    Ok(())
-}
-
-
+        Ok(())
+    }
 
     /// Owner finalizes a pending withdrawal after wait_time has elapsed.
     /// - signer: owner
     /// - accounts: owner (signer), receiver (mutable), vault_info (PDA)
-pub fn finalize(ctx: Context<FinalizeCtx>) -> Result<()> {
-    // grab account infos first
-    let vault_ai = ctx.accounts.vault_info.to_account_info();
-    let receiver_ai = ctx.accounts.receiver.to_account_info();
+    pub fn finalize(ctx: Context<FinalizeCtx>) -> Result<()> {
+        // grab account infos first
+        let vault_ai = ctx.accounts.vault_info.to_account_info();
+        let receiver_ai = ctx.accounts.receiver.to_account_info();
 
-    // now borrow mutably once
-    let vault = &mut ctx.accounts.vault_info;
+        // now borrow mutably once
+        let vault = &mut ctx.accounts.vault_info;
 
-    // state check
-    require!(vault.state == State::Req, VaultError::InvalidState);
+        // state check
+        require!(vault.state == State::Req, VaultError::InvalidState);
 
-    // slot timing check
-    let now_slot = Clock::get()?.slot;
-    let allowed_slot = vault
-        .request_time
-        .checked_add(vault.wait_time)
-        .ok_or(VaultError::TimeOverflow)?;
-    require!(now_slot >= allowed_slot, VaultError::WaitTimeNotElapsed);
+        // slot timing check
+        let now_slot = Clock::get()?.slot;
+        let allowed_slot = vault
+            .request_time
+            .checked_add(vault.wait_time)
+            .ok_or(VaultError::TimeOverflow)?;
+        require!(now_slot >= allowed_slot, VaultError::WaitTimeNotElapsed);
 
-    // lamports transfer
-    **vault_ai.try_borrow_mut_lamports()? -= vault.amount;
-    **receiver_ai.try_borrow_mut_lamports()? += vault.amount;
+        // lamports transfer
+        **vault_ai.try_borrow_mut_lamports()? -= vault.amount;
+        **receiver_ai.try_borrow_mut_lamports()? += vault.amount;
 
-    // reset vault state
-    vault.amount = 0;
-    vault.receiver = Pubkey::default();
-    vault.state = State::Idle;
+        // reset vault state
+        vault.amount = 0;
+        vault.receiver = Pubkey::default();
+        vault.state = State::Idle;
 
-    Ok(())
-}
-
+        Ok(())
+    }
 
     /// Recovery key cancels a pending withdrawal, no funds moved.
     /// - signer: recovery
@@ -287,4 +284,3 @@ pub enum VaultError {
     #[msg("Invalid state for this operation")]
     InvalidState,
 }
-

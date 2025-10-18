@@ -97,68 +97,67 @@ pub mod vault {
         Ok(())
     }
 
-pub fn finalize(ctx: Context<FinalizeCtx>) -> Result<()> {
-    require!(ctx.accounts.owner.is_signer, VaultError::OwnerMustSign);
+    pub fn finalize(ctx: Context<FinalizeCtx>) -> Result<()> {
+        require!(ctx.accounts.owner.is_signer, VaultError::OwnerMustSign);
 
-    // Validate PDA and capture bump
-    let (expected_pda, bump) = Pubkey::find_program_address(&[ctx.accounts.owner.key.as_ref()], ctx.program_id);
-    require!(expected_pda == ctx.accounts.vault_info.to_account_info().key(), VaultError::InvalidPDA);
+        // Validate PDA and capture bump
+        let (expected_pda, bump) = Pubkey::find_program_address(&[ctx.accounts.owner.key.as_ref()], ctx.program_id);
+        require!(expected_pda == ctx.accounts.vault_info.to_account_info().key(), VaultError::InvalidPDA);
 
-    // Clone AccountInfo objects we will use for lamports operations
-    let vault_ai = ctx.accounts.vault_info.to_account_info().clone();
-    let receiver_ai = ctx.accounts.receiver.to_account_info().clone();
+        // Clone AccountInfo objects we will use for lamports operations
+        let vault_ai = ctx.accounts.vault_info.to_account_info().clone();
+        let receiver_ai = ctx.accounts.receiver.to_account_info().clone();
 
-    // Read rent & lamports from cloned AccountInfo (immutable operations)
-    let data_len = vault_ai.data_len();
-    let rent = Rent::get()?;
-    let rent_exempt = rent.minimum_balance(data_len);
-    let vault_lamports = vault_ai.lamports();
+        // Read rent & lamports from cloned AccountInfo (immutable operations)
+        let data_len = vault_ai.data_len();
+        let rent = Rent::get()?;
+        let rent_exempt = rent.minimum_balance(data_len);
+        let vault_lamports = vault_ai.lamports();
 
-    // Immutable borrow to read on-chain VaultInfo fields needed for checks
-    let vault_read = &ctx.accounts.vault_info;
-    require!(vault_read.owner == ctx.accounts.owner.key(), VaultError::InvalidOwnerAccount);
-    require!(vault_read.state == State::Req, VaultError::InvalidState);
-    require!(vault_read.receiver == *receiver_ai.key, VaultError::ReceiverMismatch);
+        // Immutable borrow to read on-chain VaultInfo fields needed for checks
+        let vault_read = &ctx.accounts.vault_info;
+        require!(vault_read.owner == ctx.accounts.owner.key(), VaultError::InvalidOwnerAccount);
+        require!(vault_read.state == State::Req, VaultError::InvalidState);
+        require!(vault_read.receiver == *receiver_ai.key, VaultError::ReceiverMismatch);
 
-    // Slot-based wait check
-    let now_slot = Clock::get()?.slot as u64;
-    let ready_slot = vault_read.request_time.checked_add(vault_read.wait_time).ok_or(VaultError::TimeOverflow)?;
-    require!(now_slot >= ready_slot, VaultError::WaitTimeNotMet);
+        // Slot-based wait check
+        let now_slot = Clock::get()?.slot as u64;
+        let ready_slot = vault_read.request_time.checked_add(vault_read.wait_time).ok_or(VaultError::TimeOverflow)?;
+        require!(now_slot >= ready_slot, VaultError::WaitTimeNotMet);
 
-    // Ensure available funds
-    let available = vault_lamports.checked_sub(rent_exempt).unwrap_or(0);
-    require!(available >= vault_read.amount, VaultError::InsufficientVaultFunds);
+        // Ensure available funds
+        let available = vault_lamports.checked_sub(rent_exempt).unwrap_or(0);
+        require!(available >= vault_read.amount, VaultError::InsufficientVaultFunds);
 
-    // Read amount into a plain u64
-    let amount = vault_read.amount;
+        // Read amount into a plain u64
+        let amount = vault_read.amount;
 
-    // Mutate lamports using the cloned AccountInfo bindings (no CPI)
-    // Do checked arithmetic on plain u64s, then assign into RefMut
-    let mut from_account = vault_ai; // owned clone
-    let mut to_account = receiver_ai; // owned clone
+        // Mutate lamports using the cloned AccountInfo bindings (no CPI)
+        // Do checked arithmetic on plain u64s, then assign into RefMut
+        let mut from_account = vault_ai; // owned clone
+        let mut to_account = receiver_ai; // owned clone
 
-    let mut from_lamports_ref = from_account.try_borrow_mut_lamports()?;
-    let mut to_lamports_ref = to_account.try_borrow_mut_lamports()?;
+        let mut from_lamports_ref = from_account.try_borrow_mut_lamports()?;
+        let mut to_lamports_ref = to_account.try_borrow_mut_lamports()?;
 
-    let from_before = **from_lamports_ref;
-    let to_before = **to_lamports_ref;
+        let from_before = **from_lamports_ref;
+        let to_before = **to_lamports_ref;
 
-    let from_after = from_before.checked_sub(amount).ok_or(VaultError::InsufficientVaultFunds)?;
-    let to_after = to_before.checked_add(amount).ok_or(VaultError::Overflow)?;
+        let from_after = from_before.checked_sub(amount).ok_or(VaultError::InsufficientVaultFunds)?;
+        let to_after = to_before.checked_add(amount).ok_or(VaultError::Overflow)?;
 
-    **from_lamports_ref = from_after;
-    **to_lamports_ref = to_after;
+        **from_lamports_ref = from_after;
+        **to_lamports_ref = to_after;
 
-    // Now that lamports have been moved, take a mutable borrow to reset on-chain state
-    let vault = &mut ctx.accounts.vault_info;
-    vault.receiver = Pubkey::default();
-    vault.request_time = 0;
-    vault.amount = 0;
-    vault.state = State::Idle;
+        // Now that lamports have been moved, take a mutable borrow to reset on-chain state
+        let vault = &mut ctx.accounts.vault_info;
+        vault.receiver = Pubkey::default();
+        vault.request_time = 0;
+        vault.amount = 0;
+        vault.state = State::Idle;
 
-    Ok(())
-}
-
+        Ok(())
+    }
 
     pub fn cancel(ctx: Context<CancelCtx>) -> Result<()> {
         require!(ctx.accounts.recovery.is_signer, VaultError::RecoveryMustSign);

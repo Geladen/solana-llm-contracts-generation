@@ -224,7 +224,6 @@ pub struct ReclaimCtx<'info> {
     pub deposit_pda: Account<'info, DepositPDA>,
 }
 
-
 #[account]
 pub struct CampaignPDA {
     pub campaign_name: String,

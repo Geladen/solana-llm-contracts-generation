@@ -22,65 +22,65 @@ pub mod escrow_gpt {
         Ok(())
     }
 
-pub fn deposit(ctx: Context<DepositCtx>, _escrow_name: String) -> Result<()> {
-    // Take escrow AccountInfo first
-    let escrow_ai = ctx.accounts.escrow_info.to_account_info();
+    pub fn deposit(ctx: Context<DepositCtx>, _escrow_name: String) -> Result<()> {
+        // Take escrow AccountInfo first
+        let escrow_ai = ctx.accounts.escrow_info.to_account_info();
 
-    let escrow = &mut ctx.accounts.escrow_info;
-    require!(escrow.state == State::WaitDeposit, EscrowError::InvalidState);
-    require!(ctx.accounts.buyer.key() == escrow.buyer, EscrowError::Unauthorized);
+        let escrow = &mut ctx.accounts.escrow_info;
+        require!(escrow.state == State::WaitDeposit, EscrowError::InvalidState);
+        require!(ctx.accounts.buyer.key() == escrow.buyer, EscrowError::Unauthorized);
 
-    // Transfer lamports from buyer to PDA
-    let cpi_ctx = CpiContext::new(
-        ctx.accounts.system_program.to_account_info(),
-        anchor_lang::system_program::Transfer {
-            from: ctx.accounts.buyer.to_account_info(),
-            to: escrow_ai,
-        },
-    );
-    anchor_lang::system_program::transfer(cpi_ctx, escrow.amount_in_lamports)?;
+        // Transfer lamports from buyer to PDA
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            anchor_lang::system_program::Transfer {
+                from: ctx.accounts.buyer.to_account_info(),
+                to: escrow_ai,
+            },
+        );
+        anchor_lang::system_program::transfer(cpi_ctx, escrow.amount_in_lamports)?;
 
-    escrow.state = State::WaitRecipient;
-    Ok(())
-}
+        escrow.state = State::WaitRecipient;
+        Ok(())
+    }
 
-pub fn pay(ctx: Context<PayCtx>, _escrow_name: String) -> Result<()> {
-    let escrow_ai = ctx.accounts.escrow_info.to_account_info();
-    let seller_ai = ctx.accounts.seller.to_account_info();
+    pub fn pay(ctx: Context<PayCtx>, _escrow_name: String) -> Result<()> {
+        let escrow_ai = ctx.accounts.escrow_info.to_account_info();
+        let seller_ai = ctx.accounts.seller.to_account_info();
 
-    let escrow = &mut ctx.accounts.escrow_info;
-    require!(escrow.state == State::WaitRecipient, EscrowError::InvalidState);
-    require!(ctx.accounts.buyer.key() == escrow.buyer, EscrowError::Unauthorized);
+        let escrow = &mut ctx.accounts.escrow_info;
+        require!(escrow.state == State::WaitRecipient, EscrowError::InvalidState);
+        require!(ctx.accounts.buyer.key() == escrow.buyer, EscrowError::Unauthorized);
 
-    let balance = escrow_ai.lamports();
-    **seller_ai.try_borrow_mut_lamports()? += balance;
-    **escrow_ai.try_borrow_mut_lamports()? = 0;
+        let balance = escrow_ai.lamports();
+        **seller_ai.try_borrow_mut_lamports()? += balance;
+        **escrow_ai.try_borrow_mut_lamports()? = 0;
 
-    escrow.state = State::Closed;
-    Ok(())
-}
+        escrow.state = State::Closed;
+        Ok(())
+    }
 
-pub fn refund(ctx: Context<RefundCtx>, _escrow_name: String) -> Result<()> {
-    let escrow_ai = ctx.accounts.escrow_info.to_account_info();
-    let buyer_ai = ctx.accounts.buyer.to_account_info();
-    let seller_ai = ctx.accounts.seller.to_account_info();
+    pub fn refund(ctx: Context<RefundCtx>, _escrow_name: String) -> Result<()> {
+        let escrow_ai = ctx.accounts.escrow_info.to_account_info();
+        let buyer_ai = ctx.accounts.buyer.to_account_info();
+        let seller_ai = ctx.accounts.seller.to_account_info();
 
-    let escrow = &mut ctx.accounts.escrow_info;
-    require!(escrow.state == State::WaitRecipient, EscrowError::InvalidState);
-    require!(ctx.accounts.seller.key() == escrow.seller, EscrowError::Unauthorized);
+        let escrow = &mut ctx.accounts.escrow_info;
+        require!(escrow.state == State::WaitRecipient, EscrowError::InvalidState);
+        require!(ctx.accounts.seller.key() == escrow.seller, EscrowError::Unauthorized);
 
-    let balance = escrow_ai.lamports();
-    let rent = Rent::get()?;
-    let rent_exempt = rent.minimum_balance(EscrowInfo::LEN);
+        let balance = escrow_ai.lamports();
+        let rent = Rent::get()?;
+        let rent_exempt = rent.minimum_balance(EscrowInfo::LEN);
 
-    let refund_amount = balance.saturating_sub(rent_exempt);
-    **buyer_ai.try_borrow_mut_lamports()? += refund_amount;
-    **seller_ai.try_borrow_mut_lamports()? += rent_exempt;
-    **escrow_ai.try_borrow_mut_lamports()? = 0;
+        let refund_amount = balance.saturating_sub(rent_exempt);
+        **buyer_ai.try_borrow_mut_lamports()? += refund_amount;
+        **seller_ai.try_borrow_mut_lamports()? += rent_exempt;
+        **escrow_ai.try_borrow_mut_lamports()? = 0;
 
-    escrow.state = State::Closed;
-    Ok(())
-}
+        escrow.state = State::Closed;
+        Ok(())
+    }
 }
 
 /* ===== ACCOUNTS ===== */

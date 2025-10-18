@@ -41,34 +41,34 @@ pub mod simple_wallet {
 
     // Create a new transaction
     // Create a new transaction
-pub fn create_transaction(
-    ctx: Context<CreateTransactionCtx>,
-    _transaction_seed: String,
-    transaction_lamports_amount: u64,
-) -> Result<()> {
-    let owner = &ctx.accounts.owner;
-    let user_wallet_pda = &ctx.accounts.user_wallet_pda;
-    let transaction_pda = &mut ctx.accounts.transaction_pda;
-    let receiver = &ctx.accounts.receiver;
+    pub fn create_transaction(
+        ctx: Context<CreateTransactionCtx>,
+        _transaction_seed: String,
+        transaction_lamports_amount: u64,
+    ) -> Result<()> {
+        let owner = &ctx.accounts.owner;
+        let user_wallet_pda = &ctx.accounts.user_wallet_pda;
+        let transaction_pda = &mut ctx.accounts.transaction_pda;
+        let receiver = &ctx.accounts.receiver;
 
-    // Don't check balance during creation - only during execution
-    // This allows creating transactions for future execution when funds will be available
+        // Don't check balance during creation - only during execution
+        // This allows creating transactions for future execution when funds will be available
 
-    // Initialize transaction account
-    transaction_pda.receiver = receiver.key();
-    transaction_pda.amount_in_lamports = transaction_lamports_amount;
-    transaction_pda.executed = false;
+        // Initialize transaction account
+        transaction_pda.receiver = receiver.key();
+        transaction_pda.amount_in_lamports = transaction_lamports_amount;
+        transaction_pda.executed = false;
 
-    // Emit transaction creation event
-    emit!(SubmitTransactionEvent {
-        owner: owner.key(),
-        transaction: transaction_pda.key(),
-        receiver: receiver.key(),
-        amount: transaction_lamports_amount,
-    });
+        // Emit transaction creation event
+        emit!(SubmitTransactionEvent {
+            owner: owner.key(),
+            transaction: transaction_pda.key(),
+            receiver: receiver.key(),
+            amount: transaction_lamports_amount,
+        });
 
-    Ok(())
-}
+        Ok(())
+    }
 
     // Execute a pending transaction
     pub fn execute_transaction(

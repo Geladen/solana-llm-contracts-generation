@@ -8,26 +8,25 @@ declare_id!("3W1YqaZSvYZDwRKgr8HGGSBJsfxPLaA4615KSaGZi66u");
 pub mod crowdfund {
     use super::*;
 
-pub fn initialize(
-    ctx: Context<InitializeCtx>,
-    campaign_name: String,
-    end_donate_slot: u64,
-    goal_in_lamports: u64,
-) -> Result<()> {
-    let clock = Clock::get()?;
-    require!(end_donate_slot >= clock.slot, ErrorCode::EndSlotBeforeCurrent);
-    require!(!campaign_name.is_empty(), ErrorCode::InvalidCampaignNameLength);
-    require!(goal_in_lamports > 0, ErrorCode::InvalidGoalAmount);
+    pub fn initialize(
+        ctx: Context<InitializeCtx>,
+        campaign_name: String,
+        end_donate_slot: u64,
+        goal_in_lamports: u64,
+    ) -> Result<()> {
+        let clock = Clock::get()?;
+        require!(end_donate_slot >= clock.slot, ErrorCode::EndSlotBeforeCurrent);
+        require!(!campaign_name.is_empty(), ErrorCode::InvalidCampaignNameLength);
+        require!(goal_in_lamports > 0, ErrorCode::InvalidGoalAmount);
 
-    let campaign = &mut ctx.accounts.campaign_pda;
-    campaign.campaign_name = campaign_name;
-    campaign.campaign_owner = ctx.accounts.campaign_owner.key();
-    campaign.end_donate_slot = end_donate_slot;
-    campaign.goal_in_lamports = goal_in_lamports;
+        let campaign = &mut ctx.accounts.campaign_pda;
+        campaign.campaign_name = campaign_name;
+        campaign.campaign_owner = ctx.accounts.campaign_owner.key();
+        campaign.end_donate_slot = end_donate_slot;
+        campaign.goal_in_lamports = goal_in_lamports;
 
-    Ok(())
-}
-
+        Ok(())
+    }
 
     pub fn donate(
         ctx: Context<DonateCtx>,
@@ -64,62 +63,62 @@ pub fn initialize(
         Ok(())
     }
 
-pub fn withdraw(ctx: Context<WithdrawCtx>, _campaign_name: String) -> Result<()> {
-    let campaign = &ctx.accounts.campaign_pda;
+    pub fn withdraw(ctx: Context<WithdrawCtx>, _campaign_name: String) -> Result<()> {
+        let campaign = &ctx.accounts.campaign_pda;
 
-    let rent = Rent::get()?;
-    let rent_min = rent.minimum_balance(CampaignPDA::space());
-    let campaign_total = ctx.accounts.campaign_pda.to_account_info().lamports();
+        let rent = Rent::get()?;
+        let rent_min = rent.minimum_balance(CampaignPDA::space());
+        let campaign_total = ctx.accounts.campaign_pda.to_account_info().lamports();
 
-    // Check only the DONATED portion against the goal
-    let donated = campaign_total.saturating_sub(rent_min);
-    if donated < campaign.goal_in_lamports {
-        return err!(ErrorCode::GoalNotReached);
+        // Check only the DONATED portion against the goal
+        let donated = campaign_total.saturating_sub(rent_min);
+        if donated < campaign.goal_in_lamports {
+            return err!(ErrorCode::GoalNotReached);
+        }
+
+        // Anchor will close the campaign_pda and transfer ALL lamports (donations + rent) to owner
+        Ok(())
     }
 
-    // Anchor will close the campaign_pda and transfer ALL lamports (donations + rent) to owner
-    Ok(())
-}
+    pub fn reclaim(ctx: Context<ReclaimCtx>, _campaign_name: String) -> Result<()> {
+        let clock = Clock::get()?;
+        let campaign = &ctx.accounts.campaign_pda;
 
-pub fn reclaim(ctx: Context<ReclaimCtx>, _campaign_name: String) -> Result<()> {
-    let clock = Clock::get()?;
-    let campaign = &ctx.accounts.campaign_pda;
+        let rent = Rent::get()?;
+        let rent_min = rent.minimum_balance(CampaignPDA::space());
+        let campaign_total = ctx.accounts.campaign_pda.to_account_info().lamports();
 
-    let rent = Rent::get()?;
-    let rent_min = rent.minimum_balance(CampaignPDA::space());
-    let campaign_total = ctx.accounts.campaign_pda.to_account_info().lamports();
+        // Goal check: only donations matter
+        let donated = campaign_total.saturating_sub(rent_min);
+        if donated >= campaign.goal_in_lamports {
+            return err!(ErrorCode::GoalReachedCannotReclaim);
+        }
 
-    // Goal check: only donations matter
-    let donated = campaign_total.saturating_sub(rent_min);
-    if donated >= campaign.goal_in_lamports {
-        return err!(ErrorCode::GoalReachedCannotReclaim);
+        if clock.slot <= campaign.end_donate_slot {
+            return err!(ErrorCode::ReclaimBeforeCampaignEnd);
+        }
+
+        let deposit = &mut ctx.accounts.deposit_pda;
+        let donor_contribution = deposit.total_donated;
+        if donor_contribution == 0 {
+            return err!(ErrorCode::NoDepositToReclaim);
+        }
+
+        let campaign_acct = &mut ctx.accounts.campaign_pda.to_account_info();
+        let donor_acct = &mut ctx.accounts.donor.to_account_info();
+
+        if campaign_acct.lamports() < donor_contribution {
+            return err!(ErrorCode::InsufficientCampaignFunds);
+        }
+
+        **campaign_acct.try_borrow_mut_lamports()? -= donor_contribution;
+        **donor_acct.try_borrow_mut_lamports()? += donor_contribution;
+
+        deposit.total_donated = 0;
+
+        // Deposit PDA will close to donor (returns rent for deposit)
+        Ok(())
     }
-
-    if clock.slot <= campaign.end_donate_slot {
-        return err!(ErrorCode::ReclaimBeforeCampaignEnd);
-    }
-
-    let deposit = &mut ctx.accounts.deposit_pda;
-    let donor_contribution = deposit.total_donated;
-    if donor_contribution == 0 {
-        return err!(ErrorCode::NoDepositToReclaim);
-    }
-
-    let campaign_acct = &mut ctx.accounts.campaign_pda.to_account_info();
-    let donor_acct = &mut ctx.accounts.donor.to_account_info();
-
-    if campaign_acct.lamports() < donor_contribution {
-        return err!(ErrorCode::InsufficientCampaignFunds);
-    }
-
-    **campaign_acct.try_borrow_mut_lamports()? -= donor_contribution;
-    **donor_acct.try_borrow_mut_lamports()? += donor_contribution;
-
-    deposit.total_donated = 0;
-
-    // Deposit PDA will close to donor (returns rent for deposit)
-    Ok(())
-}
 }
 
 /// Accounts and context definitions
@@ -142,7 +141,6 @@ pub struct InitializeCtx<'info> {
 
     pub system_program: Program<'info, System>,
 }
-
 
 #[derive(Accounts)]
 #[instruction(_campaign_name: String)]

@@ -6,9 +6,6 @@ use anchor_lang::solana_program::{
 };
 declare_id!("B3C6UdHU96uL37r4CYAyEon8XMaDgjTNuW7VP9J8Ax24");
 
-
-
-
 #[program]
 pub mod payment_splitter {
     use super::*;

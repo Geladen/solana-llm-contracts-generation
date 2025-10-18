@@ -51,89 +51,88 @@ pub mod vesting {
     /// - updates `released`
     /// - closes/deallocates the vesting account when fully released (returns rent -> funder)
     pub fn release(ctx: Context<ReleaseCtx>) -> Result<()> {
-    // First: get AccountInfo before mut borrow
-    let vesting_info_ai = ctx.accounts.vesting_info.to_account_info();
+        // First: get AccountInfo before mut borrow
+        let vesting_info_ai = ctx.accounts.vesting_info.to_account_info();
 
-    // Rent-exempt math
-    let rent = Rent::get()?;
-    let vesting_lamports: u64 = **vesting_info_ai.lamports.borrow();
-    let min_rent = rent.minimum_balance(VestingInfo::LEN);
-    let locked_excluding_rent = vesting_lamports.saturating_sub(min_rent);
+        // Rent-exempt math
+        let rent = Rent::get()?;
+        let vesting_lamports: u64 = **vesting_info_ai.lamports.borrow();
+        let min_rent = rent.minimum_balance(VestingInfo::LEN);
+        let locked_excluding_rent = vesting_lamports.saturating_sub(min_rent);
 
-    // We also need released, start_slot, duration etc — snapshot them before.
-    let released_so_far = ctx.accounts.vesting_info.released;
-    let start_slot = ctx.accounts.vesting_info.start_slot;
-    let duration = ctx.accounts.vesting_info.duration;
+        // We also need released, start_slot, duration etc — snapshot them before.
+        let released_so_far = ctx.accounts.vesting_info.released;
+        let start_slot = ctx.accounts.vesting_info.start_slot;
+        let duration = ctx.accounts.vesting_info.duration;
 
-    let original_total = locked_excluding_rent
-        .checked_add(released_so_far)
-        .ok_or(error!(VestingError::ArithmeticOverflow))?;
-
-    if original_total == 0 {
-        return Err(error!(VestingError::NothingToRelease));
-    }
-
-    // Calculate vested
-    let clock = Clock::get()?;
-    let now_slot = clock.slot;
-    let vested_amount: u128 = if now_slot < start_slot {
-        0
-    } else {
-        let elapsed = now_slot - start_slot;
-        if elapsed >= duration {
-            original_total as u128
-        } else {
-            (original_total as u128)
-                .checked_mul(elapsed as u128)
-                .ok_or(error!(VestingError::ArithmeticOverflow))?
-                .checked_div(duration as u128)
-                .ok_or(error!(VestingError::ArithmeticOverflow))?
-        }
-    };
-
-    let already_released = released_so_far as u128;
-    if vested_amount <= already_released {
-        return Err(error!(VestingError::NoReleasableAmount));
-    }
-    let releasable: u64 = (vested_amount - already_released)
-        .try_into()
-        .map_err(|_| error!(VestingError::ArithmeticOverflow))?;
-
-    if releasable > locked_excluding_rent {
-        return Err(error!(VestingError::InsufficientLockedLamports));
-    }
-
-    // Transfer lamports (double-deref trick)
-    let beneficiary_ai = ctx.accounts.beneficiary.to_account_info();
-    {
-        let mut from_lamports = vesting_info_ai.lamports.borrow_mut();
-        let mut to_lamports = beneficiary_ai.lamports.borrow_mut();
-
-        let new_from = (**from_lamports)
-            .checked_sub(releasable)
+        let original_total = locked_excluding_rent
+            .checked_add(released_so_far)
             .ok_or(error!(VestingError::ArithmeticOverflow))?;
-        let new_to = (**to_lamports)
+
+        if original_total == 0 {
+            return Err(error!(VestingError::NothingToRelease));
+        }
+
+        // Calculate vested
+        let clock = Clock::get()?;
+        let now_slot = clock.slot;
+        let vested_amount: u128 = if now_slot < start_slot {
+            0
+        } else {
+            let elapsed = now_slot - start_slot;
+            if elapsed >= duration {
+                original_total as u128
+            } else {
+                (original_total as u128)
+                    .checked_mul(elapsed as u128)
+                    .ok_or(error!(VestingError::ArithmeticOverflow))?
+                    .checked_div(duration as u128)
+                    .ok_or(error!(VestingError::ArithmeticOverflow))?
+            }
+        };
+
+        let already_released = released_so_far as u128;
+        if vested_amount <= already_released {
+            return Err(error!(VestingError::NoReleasableAmount));
+        }
+        let releasable: u64 = (vested_amount - already_released)
+            .try_into()
+            .map_err(|_| error!(VestingError::ArithmeticOverflow))?;
+
+        if releasable > locked_excluding_rent {
+            return Err(error!(VestingError::InsufficientLockedLamports));
+        }
+
+        // Transfer lamports (double-deref trick)
+        let beneficiary_ai = ctx.accounts.beneficiary.to_account_info();
+        {
+            let mut from_lamports = vesting_info_ai.lamports.borrow_mut();
+            let mut to_lamports = beneficiary_ai.lamports.borrow_mut();
+
+            let new_from = (**from_lamports)
+                .checked_sub(releasable)
+                .ok_or(error!(VestingError::ArithmeticOverflow))?;
+            let new_to = (**to_lamports)
+                .checked_add(releasable)
+                .ok_or(error!(VestingError::ArithmeticOverflow))?;
+
+            **from_lamports = new_from;
+            **to_lamports = new_to;
+        }
+
+        // NOW it’s safe to take mutable borrow of vesting_info again
+        let vesting = &mut ctx.accounts.vesting_info;
+        vesting.released = vesting
+            .released
             .checked_add(releasable)
             .ok_or(error!(VestingError::ArithmeticOverflow))?;
 
-        **from_lamports = new_from;
-        **to_lamports = new_to;
+        if vesting.released == original_total {
+            vesting.close(ctx.accounts.funder.to_account_info())?;
+        }
+
+        Ok(())
     }
-
-    // NOW it’s safe to take mutable borrow of vesting_info again
-    let vesting = &mut ctx.accounts.vesting_info;
-    vesting.released = vesting
-        .released
-        .checked_add(releasable)
-        .ok_or(error!(VestingError::ArithmeticOverflow))?;
-
-    if vesting.released == original_total {
-        vesting.close(ctx.accounts.funder.to_account_info())?;
-    }
-
-    Ok(())
-}
-
 }
 
 // ----------------------------- Accounts contexts -----------------------------

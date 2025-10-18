@@ -65,58 +65,57 @@ pub mod auction {
 
     /// Place a bid. Caller must be the bidder signer and must pass the current highest bidder account
     /// (the account which will be refunded). The bid amount must be greater than current highest_bid.
-pub fn bid(
-    ctx: Context<BidCtx>,
-    auctioned_object: String,
-    amount_to_deposit: u64,
-) -> Result<()> {
-    require!(auctioned_object.len() <= MAX_OBJECT_LEN, AuctionError::ObjectTooLong);
+    pub fn bid(
+        ctx: Context<BidCtx>,
+        auctioned_object: String,
+        amount_to_deposit: u64,
+    ) -> Result<()> {
+        require!(auctioned_object.len() <= MAX_OBJECT_LEN, AuctionError::ObjectTooLong);
 
-    // Immutable borrow only
-    {
-        let auction = &ctx.accounts.auction_info;
+        // Immutable borrow only
+        {
+            let auction = &ctx.accounts.auction_info;
 
-        require!(auction.object == auctioned_object, AuctionError::ObjectMismatch);
-        let clock = Clock::get()?;
-        require!(clock.slot < auction.end_time, AuctionError::AuctionEnded);
-        require!(amount_to_deposit > auction.highest_bid, AuctionError::BidTooLow);
-        require_keys_eq!(
-            auction.highest_bidder,
-            ctx.accounts.current_highest_bidder.key(),
-            AuctionError::InvalidPreviousHighestBidder
+            require!(auction.object == auctioned_object, AuctionError::ObjectMismatch);
+            let clock = Clock::get()?;
+            require!(clock.slot < auction.end_time, AuctionError::AuctionEnded);
+            require!(amount_to_deposit > auction.highest_bid, AuctionError::BidTooLow);
+            require_keys_eq!(
+                auction.highest_bidder,
+                ctx.accounts.current_highest_bidder.key(),
+                AuctionError::InvalidPreviousHighestBidder
+            );
+        }
+
+        // First transfer new bid into PDA
+        let transfer_ix = system_instruction::transfer(
+            &ctx.accounts.bidder.key(),
+            &ctx.accounts.auction_info.key(),
+            amount_to_deposit,
         );
+        invoke(
+            &transfer_ix,
+            &[
+                ctx.accounts.bidder.to_account_info(),
+                ctx.accounts.auction_info.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+
+        // Refund old highest bidder (need previous amount and key)
+        let prev_amount = ctx.accounts.auction_info.highest_bid;
+        if prev_amount > 0 {
+            **ctx.accounts.auction_info.to_account_info().try_borrow_mut_lamports()? -= prev_amount;
+            **ctx.accounts.current_highest_bidder.to_account_info().try_borrow_mut_lamports()? += prev_amount;
+        }
+
+        // Now re-borrow mutably to update state
+        let auction = &mut ctx.accounts.auction_info;
+        auction.highest_bidder = ctx.accounts.bidder.key();
+        auction.highest_bid = amount_to_deposit;
+
+        Ok(())
     }
-
-    // First transfer new bid into PDA
-    let transfer_ix = system_instruction::transfer(
-        &ctx.accounts.bidder.key(),
-        &ctx.accounts.auction_info.key(),
-        amount_to_deposit,
-    );
-    invoke(
-        &transfer_ix,
-        &[
-            ctx.accounts.bidder.to_account_info(),
-            ctx.accounts.auction_info.to_account_info(),
-            ctx.accounts.system_program.to_account_info(),
-        ],
-    )?;
-
-    // Refund old highest bidder (need previous amount and key)
-    let prev_amount = ctx.accounts.auction_info.highest_bid;
-    if prev_amount > 0 {
-        **ctx.accounts.auction_info.to_account_info().try_borrow_mut_lamports()? -= prev_amount;
-        **ctx.accounts.current_highest_bidder.to_account_info().try_borrow_mut_lamports()? += prev_amount;
-    }
-
-    // Now re-borrow mutably to update state
-    let auction = &mut ctx.accounts.auction_info;
-    auction.highest_bidder = ctx.accounts.bidder.key();
-    auction.highest_bid = amount_to_deposit;
-
-    Ok(())
-}
-
 
     /// End the auction. Only the seller may call this. Must only be called after auction end_time.
     /// Transfers the highest bid from PDA to seller, then closes the PDA (rent returned to seller).

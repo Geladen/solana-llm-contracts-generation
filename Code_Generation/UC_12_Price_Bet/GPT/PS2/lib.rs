@@ -11,7 +11,7 @@ const STALENESS_THRESHOLD_SECONDS: u64 = 60;
 // -- NOTE: This program validates the Pyth oracle account owner against the well-known
 // mainnet Pyth program ID. If you deploy to devnet/testnet or use a different Pyth program,
 // replace this string with the correct program id for that cluster.
-const PYTH_MAINNET_PROGRAM_ID_STR: &str = "FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH";
+const PYTH_MAINNET_PROGRAM_ID_STR: &str = "3sG19eiLedgp2pxAyTyimSt1bMTboiPrJ6SiGMA9Qw1N";
 
 #[program]
 pub mod price_bet {
@@ -21,79 +21,77 @@ pub mod price_bet {
     /// - delay: number of seconds from now until deadline
     /// - wager: lamports the owner deposits as the initial pot
     /// - rate: target rate (IN PYTH RAW PRICE UNITS — see notes)
-pub fn init(ctx: Context<InitCtx>, delay: u64, wager: u64, rate: u64) -> Result<()> {
-    let clock = Clock::get()?;
-    let now = clock.unix_timestamp as u64;
-    let deadline = now.checked_add(delay).ok_or(ErrorCode::ArithmeticOverflow)?;
+    pub fn init(ctx: Context<InitCtx>, delay: u64, wager: u64, rate: u64) -> Result<()> {
+        let clock = Clock::get()?;
+        let now = clock.unix_timestamp as u64;
+        let deadline = now.checked_add(delay).ok_or(ErrorCode::ArithmeticOverflow)?;
 
-    // Fill struct fields
-    {
-        let bet = &mut ctx.accounts.bet_info;
-        bet.owner = ctx.accounts.owner.key();
-        bet.player = Pubkey::default();
-        bet.wager = wager;
-        bet.deadline = deadline;
-        bet.rate = rate;
+        // Fill struct fields
+        {
+            let bet = &mut ctx.accounts.bet_info;
+            bet.owner = ctx.accounts.owner.key();
+            bet.player = Pubkey::default();
+            bet.wager = wager;
+            bet.deadline = deadline;
+            bet.rate = rate;
+        }
+
+        // Transfer after dropping the mutable borrow
+        let cpi_accounts = anchor_lang::system_program::Transfer {
+            from: ctx.accounts.owner.to_account_info(),
+            to: ctx.accounts.bet_info.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
+        system_program::transfer(cpi_ctx, wager)?;
+
+        msg!(
+            "Init: owner {} created bet PDA {} with wager {} lamports, deadline {} (unix)",
+            ctx.accounts.owner.key(),
+            ctx.accounts.bet_info.key(),
+            wager,
+            deadline
+        );
+
+        Ok(())
     }
-
-    // Transfer after dropping the mutable borrow
-    let cpi_accounts = anchor_lang::system_program::Transfer {
-        from: ctx.accounts.owner.to_account_info(),
-        to: ctx.accounts.bet_info.to_account_info(),
-    };
-    let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
-    system_program::transfer(cpi_ctx, wager)?;
-
-    msg!(
-        "Init: owner {} created bet PDA {} with wager {} lamports, deadline {} (unix)",
-        ctx.accounts.owner.key(),
-        ctx.accounts.bet_info.key(),
-        wager,
-        deadline
-    );
-
-    Ok(())
-}
-
 
     /// join: called by the player (signer)
     /// - player transfers a matching wager to the bet PDA
     pub fn join(ctx: Context<JoinCtx>) -> Result<()> {
-    let clock = Clock::get()?;
-    let now = clock.unix_timestamp as u64;
+        let clock = Clock::get()?;
+        let now = clock.unix_timestamp as u64;
 
-    // Immutable borrow for checks
-    {
-        let bet = &ctx.accounts.bet_info;
-        require!(bet.player == Pubkey::default(), ErrorCode::AlreadyHasPlayer);
-        require!(ctx.accounts.player.key() != bet.owner, ErrorCode::PlayerIsOwner);
-        require!(now < bet.deadline, ErrorCode::BetAlreadyExpired);
+        // Immutable borrow for checks
+        {
+            let bet = &ctx.accounts.bet_info;
+            require!(bet.player == Pubkey::default(), ErrorCode::AlreadyHasPlayer);
+            require!(ctx.accounts.player.key() != bet.owner, ErrorCode::PlayerIsOwner);
+            require!(now < bet.deadline, ErrorCode::BetAlreadyExpired);
+        }
+
+        let wager = ctx.accounts.bet_info.wager;
+
+        // Transfer player's matching wager
+        let cpi_accounts = anchor_lang::system_program::Transfer {
+            from: ctx.accounts.player.to_account_info(),
+            to: ctx.accounts.bet_info.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
+        system_program::transfer(cpi_ctx, wager)?;
+
+        // Now mutate the account
+        ctx.accounts.bet_info.player = ctx.accounts.player.key();
+
+        msg!(
+            "Join: player {} joined bet {} by owner {} (wager {}).",
+            ctx.accounts.player.key(),
+            ctx.accounts.bet_info.key(),
+            ctx.accounts.owner.key(),
+            wager
+        );
+
+        Ok(())
     }
-
-    let wager = ctx.accounts.bet_info.wager;
-
-    // Transfer player's matching wager
-    let cpi_accounts = anchor_lang::system_program::Transfer {
-        from: ctx.accounts.player.to_account_info(),
-        to: ctx.accounts.bet_info.to_account_info(),
-    };
-    let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
-    system_program::transfer(cpi_ctx, wager)?;
-
-    // Now mutate the account
-    ctx.accounts.bet_info.player = ctx.accounts.player.key();
-
-    msg!(
-        "Join: player {} joined bet {} by owner {} (wager {}).",
-        ctx.accounts.player.key(),
-        ctx.accounts.bet_info.key(),
-        ctx.accounts.owner.key(),
-        wager
-    );
-
-    Ok(())
-}
-
 
     /// win: called by the player (signer) after the deadline (player claims if price condition met)
     /// * validates Pyth feed account owner and staleness (uses `load_price_feed_from_account_info`).

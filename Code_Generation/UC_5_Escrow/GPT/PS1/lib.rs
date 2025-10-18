@@ -337,7 +337,6 @@ pub struct EscrowInfo {
     pub state: State,
 }
 
-
 impl EscrowInfo {
     /// Anchor discriminator (8) + fields
     pub const LEN: usize = 8 + 32 + 32 + 8 + 1;
@@ -350,7 +349,6 @@ pub enum State {
     WaitRecipient,
     Closed,
 }
-
 
 /* -------------------------
    Errors

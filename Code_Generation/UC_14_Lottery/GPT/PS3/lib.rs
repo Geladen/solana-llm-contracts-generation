@@ -7,58 +7,57 @@ pub mod lottery_gpt {
     use super::*;
 
     pub fn join(
-    ctx: Context<Join>,
-    bet_amount_p1: u64,
-    player1_commitment: [u8; 32],
-    bet_amount_p2: u64,
-    player2_commitment: [u8; 32],
-) -> Result<()> {
-    // clone AccountInfos before taking mutable borrow
-    let lottery_info_ai = ctx.accounts.lottery_info.to_account_info();
+        ctx: Context<Join>,
+        bet_amount_p1: u64,
+        player1_commitment: [u8; 32],
+        bet_amount_p2: u64,
+        player2_commitment: [u8; 32],
+    ) -> Result<()> {
+        // clone AccountInfos before taking mutable borrow
+        let lottery_info_ai = ctx.accounts.lottery_info.to_account_info();
 
-    // Both players must bet the same
-    require!(bet_amount_p1 == bet_amount_p2, LotteryError::UnequalBets);
+        // Both players must bet the same
+        require!(bet_amount_p1 == bet_amount_p2, LotteryError::UnequalBets);
 
-    // Transfer player1 bet
-    transfer(
-        CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.player1.to_account_info(),
-                to: lottery_info_ai.clone(),
-            },
-        ),
-        bet_amount_p1,
-    )?;
+        // Transfer player1 bet
+        transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.player1.to_account_info(),
+                    to: lottery_info_ai.clone(),
+                },
+            ),
+            bet_amount_p1,
+        )?;
 
-    // Transfer player2 bet
-    transfer(
-        CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            Transfer {
-                from: ctx.accounts.player2.to_account_info(),
-                to: lottery_info_ai.clone(),
-            },
-        ),
-        bet_amount_p2,
-    )?;
+        // Transfer player2 bet
+        transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.player2.to_account_info(),
+                    to: lottery_info_ai.clone(),
+                },
+            ),
+            bet_amount_p2,
+        )?;
 
-    // now safe to mutably borrow
-    let lottery = &mut ctx.accounts.lottery_info;
+        // now safe to mutably borrow
+        let lottery = &mut ctx.accounts.lottery_info;
 
-    lottery.player1 = ctx.accounts.player1.key();
-    lottery.player2 = ctx.accounts.player2.key();
-    lottery.bet_amount = bet_amount_p1;
-    lottery.commitment1 = player1_commitment;
-    lottery.commitment2 = player2_commitment;
-    lottery.state = LotteryState::RevealP1;
+        lottery.player1 = ctx.accounts.player1.key();
+        lottery.player2 = ctx.accounts.player2.key();
+        lottery.bet_amount = bet_amount_p1;
+        lottery.commitment1 = player1_commitment;
+        lottery.commitment2 = player2_commitment;
+        lottery.state = LotteryState::RevealP1;
 
-    let clock = Clock::get()?;
-    lottery.reveal_deadline = clock.unix_timestamp + 10;
+        let clock = Clock::get()?;
+        lottery.reveal_deadline = clock.unix_timestamp + 10;
 
-    Ok(())
-}
-
+        Ok(())
+    }
 
     pub fn reveal_p1(ctx: Context<RevealP1>, secret: String) -> Result<()> {
         let lottery = &mut ctx.accounts.lottery_info;

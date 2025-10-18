@@ -114,32 +114,32 @@ pub mod lottery {
         lottery.secret2 = secret.clone();
         lottery.state = LotteryState::RevealP2;
 
-// Determine winner: (secret1.len() + secret2.len()) % 2
-let s1_len = lottery.secret1.len();
-let s2_len = secret.len();
-let parity = (s1_len + s2_len) % 2;
+        // Determine winner: (secret1.len() + secret2.len()) % 2
+        let s1_len = lottery.secret1.len();
+        let s2_len = secret.len();
+        let parity = (s1_len + s2_len) % 2;
 
-// Obtain mutable AccountInfo references
-let mut lottery_ai = ctx.accounts.lottery_info.to_account_info();
-let mut player1_ai = ctx.accounts.player1.to_account_info();
-let mut player2_ai = ctx.accounts.player2.to_account_info();
+        // Obtain mutable AccountInfo references
+        let mut lottery_ai = ctx.accounts.lottery_info.to_account_info();
+        let mut player1_ai = ctx.accounts.player1.to_account_info();
+        let mut player2_ai = ctx.accounts.player2.to_account_info();
 
-// Choose winner as a mutable AccountInfo reference
-let winner_ai: &mut AccountInfo = if parity == 0 {
-    &mut player1_ai
-} else {
-    &mut player2_ai
-};
+        // Choose winner as a mutable AccountInfo reference
+        let winner_ai: &mut AccountInfo = if parity == 0 {
+            &mut player1_ai
+        } else {
+            &mut player2_ai
+        };
 
-let pot = **lottery_ai.lamports.borrow();
-require!(pot > 0, LotteryError::NoPot);
+        let pot = **lottery_ai.lamports.borrow();
+        require!(pot > 0, LotteryError::NoPot);
 
-// Drain PDA and credit winner safely
-**lottery_ai.lamports.borrow_mut() = 0u64;
-**winner_ai.lamports.borrow_mut() = winner_ai
-    .lamports()
-    .checked_add(pot)
-    .ok_or(LotteryError::LamportOverflow)?;
+        // Drain PDA and credit winner safely
+        **lottery_ai.lamports.borrow_mut() = 0u64;
+        **winner_ai.lamports.borrow_mut() = winner_ai
+        .lamports()
+        .checked_add(pot)
+        .ok_or(LotteryError::LamportOverflow)?;
 
         Ok(())
     }

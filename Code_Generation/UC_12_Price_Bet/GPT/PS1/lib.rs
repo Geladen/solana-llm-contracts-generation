@@ -76,70 +76,66 @@ pub mod price_bet {
     }
 
     /// Player claims pot if price condition satisfied.
-pub fn win(ctx: Context<WinCtx>) -> Result<()> {
-    let clock = Clock::get()?;
-    let bet = &ctx.accounts.bet_info;
+    pub fn win(ctx: Context<WinCtx>) -> Result<()> {
+        let clock = Clock::get()?;
+        let bet = &ctx.accounts.bet_info;
 
-    // Reject if deadline has passed
-    require!(
-        (clock.unix_timestamp as u64) < bet.deadline,
-        BetError::DeadlinePassed
-    );
+        // Reject if deadline has passed
+        require!(
+            (clock.unix_timestamp as u64) < bet.deadline,
+            BetError::DeadlinePassed
+        );
 
-    // Check that the player matches
-    require!(
-        bet.player == *ctx.accounts.player.key,
-        BetError::UnauthorizedPlayer
-    );
+        // Check that the player matches
+        require!(
+            bet.player == *ctx.accounts.player.key,
+            BetError::UnauthorizedPlayer
+        );
 
-    // Load Pyth price feed safely
-    let price_feed = load_price_feed_from_account_info(&ctx.accounts.price_feed)
-        .map_err(|_| BetError::InvalidOracleOwner)?;
+        // Load Pyth price feed safely
+        let price_feed = load_price_feed_from_account_info(&ctx.accounts.price_feed)
+            .map_err(|_| BetError::InvalidOracleOwner)?;
 
-    let price_data = price_feed
-        .get_price_no_older_than(clock.slot as i64, 120)
-        .ok_or(BetError::PriceStale)?;
+        let price_data = price_feed
+            .get_price_no_older_than(clock.slot as i64, 120)
+            .ok_or(BetError::PriceStale)?;
 
-    // Compare price to rate
-    require!(
-        price_data.price >= bet.rate as i64,
-        BetError::BetNotWon
-    );
+        // Compare price to rate
+        require!(
+            price_data.price >= bet.rate as i64,
+            BetError::BetNotWon
+        );
 
-    // Transfer lamports to player and close PDA
-    let player_account = &mut ctx.accounts.player.to_account_info();
-    let bet_account = &mut ctx.accounts.bet_info.to_account_info();
+        // Transfer lamports to player and close PDA
+        let player_account = &mut ctx.accounts.player.to_account_info();
+        let bet_account = &mut ctx.accounts.bet_info.to_account_info();
 
-    **player_account.try_borrow_mut_lamports()? += **bet_account.lamports.borrow();
-    **bet_account.try_borrow_mut_lamports()? = 0;
+        **player_account.try_borrow_mut_lamports()? += **bet_account.lamports.borrow();
+        **bet_account.try_borrow_mut_lamports()? = 0;
 
-    Ok(())
-}
-
-
-
+        Ok(())
+    }
 
     /// Owner reclaims pot after deadline if no win occurred.
-pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
-    let clock = Clock::get()?;
-    let bet = &ctx.accounts.bet_info;
+    pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
+        let clock = Clock::get()?;
+        let bet = &ctx.accounts.bet_info;
 
-    // Only allow timeout after deadline
-    require!(
-        (clock.unix_timestamp as u64) >= bet.deadline,
-        BetError::DeadlineNotPassed
-    );
+        // Only allow timeout after deadline
+        require!(
+            (clock.unix_timestamp as u64) >= bet.deadline,
+            BetError::DeadlineNotPassed
+        );
 
-    // Only owner can timeout
-    require!(
-        bet.owner == *ctx.accounts.owner.key,
-        BetError::UnauthorizedOwner
-    );
+        // Only owner can timeout
+        require!(
+            bet.owner == *ctx.accounts.owner.key,
+            BetError::UnauthorizedOwner
+        );
 
-    // No need for manual transfer: `close = owner` handles lamports refund and account closure
-    Ok(())
-}
-
+        // No need for manual transfer: `close = owner` handles lamports refund and account closure
+        Ok(())
+    }
 }
 
 // ------------------------- Accounts -------------------------
@@ -200,7 +196,6 @@ pub struct WinCtx<'info> {
     pub system_program: Program<'info, System>,
 }
 
-
 #[derive(Accounts)]
 pub struct TimeoutCtx<'info> {
     #[account(mut)]
@@ -255,4 +250,3 @@ pub enum BetError {
     #[msg("Player did not win")]
     BetNotWon,
 }
-

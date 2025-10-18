@@ -68,79 +68,77 @@ pub mod simple_wallet {
     }
 
     pub fn create_transaction(
-    ctx: Context<CreateTransactionCtx>,
-    transaction_seed: String,
-    transaction_lamports_amount: u64,
-) -> Result<()> {
-    // Copy key first
-    let tx_key = ctx.accounts.transaction_pda.key();
-    let receiver_key = ctx.accounts.receiver.key();
+        ctx: Context<CreateTransactionCtx>,
+        transaction_seed: String,
+        transaction_lamports_amount: u64,
+    ) -> Result<()> {
+        // Copy key first
+        let tx_key = ctx.accounts.transaction_pda.key();
+        let receiver_key = ctx.accounts.receiver.key();
 
-    // Now mutate transaction PDA
-    let tx = &mut ctx.accounts.transaction_pda;
-    tx.receiver = ctx.accounts.receiver.key();
-    tx.amount_in_lamports = transaction_lamports_amount;
-    tx.executed = false;
+        // Now mutate transaction PDA
+        let tx = &mut ctx.accounts.transaction_pda;
+        tx.receiver = ctx.accounts.receiver.key();
+        tx.amount_in_lamports = transaction_lamports_amount;
+        tx.executed = false;
 
-    emit!(SubmitTransaction {
-        transaction_pda: tx_key,
-        receiver: receiver_key,
-        amount: tx.amount_in_lamports,
-    });
+        emit!(SubmitTransaction {
+            transaction_pda: tx_key,
+            receiver: receiver_key,
+            amount: tx.amount_in_lamports,
+        });
 
-    Ok(())
-}
-
+        Ok(())
+    }
 
     pub fn execute_transaction(
-    ctx: Context<ExecuteTransactionCtx>,
-    _transaction_seed: String,
-) -> Result<()> {
-    // Copy keys first
-    let tx_key = ctx.accounts.transaction_pda.key();
-    let receiver_key = ctx.accounts.transaction_pda.receiver;
+        ctx: Context<ExecuteTransactionCtx>,
+        _transaction_seed: String,
+    ) -> Result<()> {
+        // Copy keys first
+        let tx_key = ctx.accounts.transaction_pda.key();
+        let receiver_key = ctx.accounts.transaction_pda.receiver;
 
-    // Mutable borrow
-    let tx = &mut ctx.accounts.transaction_pda;
-    require!(!tx.executed, ErrorCode::TransactionAlreadyExecuted);
-    require!(
-        ctx.accounts.user_wallet_pda.lamports() >= tx.amount_in_lamports,
-        ErrorCode::InsufficientFunds
-    );
+        // Mutable borrow
+        let tx = &mut ctx.accounts.transaction_pda;
+        require!(!tx.executed, ErrorCode::TransactionAlreadyExecuted);
+        require!(
+            ctx.accounts.user_wallet_pda.lamports() >= tx.amount_in_lamports,
+            ErrorCode::InsufficientFunds
+        );
 
-    let seeds = &[
-        b"wallet".as_ref(),
-        ctx.accounts.owner.key.as_ref(),
-        &[ctx.bumps.user_wallet_pda],
-    ];
+        let seeds = &[
+            b"wallet".as_ref(),
+            ctx.accounts.owner.key.as_ref(),
+            &[ctx.bumps.user_wallet_pda],
+        ];
 
-    let ix = system_instruction::transfer(
-        &ctx.accounts.user_wallet_pda.key(),
-        &tx.receiver,
-        tx.amount_in_lamports,
-    );
+        let ix = system_instruction::transfer(
+            &ctx.accounts.user_wallet_pda.key(),
+            &tx.receiver,
+            tx.amount_in_lamports,
+        );
 
-    sol_program::invoke_signed(
-        &ix,
-        &[
-            ctx.accounts.user_wallet_pda.to_account_info(),
-            ctx.accounts.receiver.to_account_info(),
-            ctx.accounts.system_program.to_account_info(),
-        ],
-        &[seeds],
-    )?;
+        sol_program::invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.user_wallet_pda.to_account_info(),
+                ctx.accounts.receiver.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            &[seeds],
+        )?;
 
-    tx.executed = true;
+        tx.executed = true;
 
-    emit!(ExecuteTransaction {
-        transaction_pda: tx_key,
-        receiver: receiver_key,
-        amount: tx.amount_in_lamports,
-    });
+        emit!(ExecuteTransaction {
+            transaction_pda: tx_key,
+            receiver: receiver_key,
+            amount: tx.amount_in_lamports,
+        });
 
-    Ok(())
-}
-
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]

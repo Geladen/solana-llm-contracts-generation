@@ -228,4 +228,3 @@ pub enum ErrorCode {
     #[msg("Caller is not a participant.")]
     Unauthorized,
 }
-

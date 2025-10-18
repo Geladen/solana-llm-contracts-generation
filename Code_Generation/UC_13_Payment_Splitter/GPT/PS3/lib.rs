@@ -33,18 +33,18 @@ pub mod playment_gpt {
         Ok(())
     }
 
-pub fn release(ctx: Context<Release>) -> Result<()> {
-    // Step 1: read lamports into a temporary variable BEFORE taking a mutable borrow
-    let ps_lamports_val = **ctx.accounts.ps_info.to_account_info().lamports.borrow();
+    pub fn release(ctx: Context<Release>) -> Result<()> {
+        // Step 1: read lamports into a temporary variable BEFORE taking a mutable borrow
+        let ps_lamports_val = **ctx.accounts.ps_info.to_account_info().lamports.borrow();
 
-    // Step 2: now borrow the account mutably
-    let ps_info = &mut ctx.accounts.ps_info;
+        // Step 2: now borrow the account mutably
+        let ps_info = &mut ctx.accounts.ps_info;
 
-    // Step 3: assign the lamports value safely
-    ps_info.current_lamports = ps_lamports_val;
+        // Step 3: assign the lamports value safely
+        ps_info.current_lamports = ps_lamports_val;
 
-    Ok(())
-}
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]

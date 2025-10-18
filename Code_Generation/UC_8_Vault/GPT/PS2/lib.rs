@@ -30,7 +30,6 @@ pub mod vault {
         vault.request_time = 0;
         vault.amount = 0;
         vault.state = State::Idle;
-        
 
         // If initial_amount requested, transfer lamports from owner -> vault via system program CPI
         if initial_amount > 0 {
@@ -50,50 +49,47 @@ pub mod vault {
     /// Owner requests a withdrawal of `amount` to `receiver`.
     /// Moves vault into `Req` state and records request_time.
     pub fn withdraw(ctx: Context<WithdrawCtx>, amount: u64) -> Result<()> {
-    let vault = &mut ctx.accounts.vault_info;
+        let vault = &mut ctx.accounts.vault_info;
 
-require!(vault.state == State::Idle, ErrorCode::InvalidState);
+        require!(vault.state == State::Idle, ErrorCode::InvalidState);
 
-let clock = Clock::get()?;
-vault.state = State::Req;
-vault.amount = amount;
-vault.receiver = ctx.accounts.receiver.key();
-vault.request_time = clock.slot;
+        let clock = Clock::get()?;
+        vault.state = State::Req;
+        vault.amount = amount;
+        vault.receiver = ctx.accounts.receiver.key();
+        vault.request_time = clock.slot;
 
-
-    Ok(())
-}
-
+        Ok(())
+    }
 
     /// Owner finalizes a pending withdrawal after the wait time has elapsed.
     /// Funds are transferred to `receiver`. `receiver` must match the recorded receiver in vault_info.
     pub fn finalize(ctx: Context<FinalizeCtx>) -> Result<()> {
-    let vault = &mut ctx.accounts.vault_info;
+        let vault = &mut ctx.accounts.vault_info;
 
-    require!(vault.state == State::Req, ErrorCode::InvalidState);
+        require!(vault.state == State::Req, ErrorCode::InvalidState);
 
-let clock = Clock::get()?;
-require!(
-    clock.slot >= vault.request_time + vault.wait_time,
-    ErrorCode::WithdrawalNotReady
-);
+        let clock = Clock::get()?;
+        require!(
+            clock.slot >= vault.request_time + vault.wait_time,
+            ErrorCode::WithdrawalNotReady
+        );
 
-let vault_ai = vault.to_account_info();
-let receiver_ai = ctx.accounts.receiver.to_account_info();
+        let vault_ai = vault.to_account_info();
+        let receiver_ai = ctx.accounts.receiver.to_account_info();
 
-**vault_ai.try_borrow_mut_lamports()? -= vault.amount;
-**receiver_ai.try_borrow_mut_lamports()? += vault.amount;
+        **vault_ai.try_borrow_mut_lamports()? -= vault.amount;
+        **receiver_ai.try_borrow_mut_lamports()? += vault.amount;
 
-// reset
-vault.receiver = Pubkey::default();
-vault.request_time = 0;
-vault.amount = 0;
-vault.state = State::Idle;
+        // reset
+        vault.receiver = Pubkey::default();
+        vault.request_time = 0;
+        vault.amount = 0;
+        vault.state = State::Idle;
 
 
-    Ok(())
-}
-
+        Ok(())
+    }
 
     /// Recovery key cancels a pending withdrawal request. No funds move.
     pub fn cancel(ctx: Context<CancelCtx>) -> Result<()> {
@@ -115,11 +111,10 @@ vault.state = State::Idle;
         }
 
         // Clear request state (no funds are moved)
-vault.state = State::Idle;
-vault.receiver = Pubkey::default();
-vault.request_time = 0;
-vault.amount = 0;
-
+        vault.state = State::Idle;
+        vault.receiver = Pubkey::default();
+        vault.request_time = 0;
+        vault.amount = 0;
 
         Ok(())
     }

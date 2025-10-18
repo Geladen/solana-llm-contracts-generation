@@ -121,7 +121,6 @@ pub struct DepositOrWithdrawCtx<'info> {
     pub system_program: Program<'info, System>,
 }
 
-
 #[derive(Accounts)]
 #[instruction(transaction_seed: String)]
 pub struct CreateTransactionCtx<'info> {
@@ -185,7 +184,6 @@ pub struct ExecuteTransactionCtx<'info> {
 
     pub system_program: Program<'info, System>,
 }
-
 
 // PDA State
 #[account]

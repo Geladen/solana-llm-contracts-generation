@@ -75,28 +75,27 @@ pub mod htlc {
     }
 
     /// Timeout claim by verifier after reveal_timeout
-pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
-    let htlc = &mut ctx.accounts.htlc_info;
-    let clock = Clock::get()?;
+    pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
+        let htlc = &mut ctx.accounts.htlc_info;
+        let clock = Clock::get()?;
 
-    // DEBUG: log current slot and reveal_timeout
-    msg!("Current slot: {}", clock.slot);
-    msg!("Reveal timeout slot: {}", htlc.reveal_timeout);
+        // DEBUG: log current slot and reveal_timeout
+        msg!("Current slot: {}", clock.slot);
+        msg!("Reveal timeout slot: {}", htlc.reveal_timeout);
 
-    // Ensure timeout has passed
-    if clock.slot < htlc.reveal_timeout {
-        return err!(HTLCError::TimeoutNotReached);
+        // Ensure timeout has passed
+        if clock.slot < htlc.reveal_timeout {
+            return err!(HTLCError::TimeoutNotReached);
+        }
+
+        let htlc_lamports = **htlc.to_account_info().lamports.borrow();
+
+        // Transfer all HTLC funds to verifier
+        **htlc.to_account_info().try_borrow_mut_lamports()? -= htlc_lamports;
+        **ctx.accounts.verifier.to_account_info().try_borrow_mut_lamports()? += htlc_lamports;
+
+        Ok(())
     }
-
-    let htlc_lamports = **htlc.to_account_info().lamports.borrow();
-
-    // Transfer all HTLC funds to verifier
-    **htlc.to_account_info().try_borrow_mut_lamports()? -= htlc_lamports;
-    **ctx.accounts.verifier.to_account_info().try_borrow_mut_lamports()? += htlc_lamports;
-
-    Ok(())
-}
-
 }
 
 #[derive(Accounts)]
@@ -170,4 +169,3 @@ pub enum HTLCError {
     #[msg("Timeout has not been reached yet")]
     TimeoutNotReached,
 }
-

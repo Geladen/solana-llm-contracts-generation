@@ -4,7 +4,6 @@ use anchor_lang::solana_program::{
     system_instruction,
 };
 
-
 declare_id!("32ZGtf1q1qFhsmrtzxcfNfCCBR17uW6g94bMAYPah8Z3");
 
 const MAX_OBJECT_LEN: usize = 64;

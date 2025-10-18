@@ -34,7 +34,6 @@ pub mod auction {
         Ok(())
     }
 
-
     pub fn bid(
         ctx: Context<BidCtx>,
         auctioned_object: String,

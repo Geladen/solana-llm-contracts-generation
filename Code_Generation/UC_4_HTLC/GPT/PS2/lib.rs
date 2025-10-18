@@ -137,7 +137,6 @@ pub struct InitializeCtx<'info> {
     pub system_program: Program<'info, System>,
 }
 
-
 /// Accounts for reveal
 #[derive(Accounts)]
 pub struct RevealCtx<'info> {

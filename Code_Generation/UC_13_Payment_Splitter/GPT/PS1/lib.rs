@@ -66,59 +66,58 @@ pub mod payment_splitter {
         Ok(())
     }
 
-pub fn release(ctx: Context<ReleaseCtx>) -> Result<()> {
-    let payee_key = ctx.accounts.payee.key();
-    let initializer_key = ctx.accounts.initializer.key();
-    let ps = &mut ctx.accounts.ps_info;
+    pub fn release(ctx: Context<ReleaseCtx>) -> Result<()> {
+        let payee_key = ctx.accounts.payee.key();
+        let initializer_key = ctx.accounts.initializer.key();
+        let ps = &mut ctx.accounts.ps_info;
 
-    let idx = ps
-        .payees
-        .iter()
-        .position(|k| k == &payee_key)
-        .ok_or(PaymentSplitterError::PayeeNotFound)?;
+        let idx = ps
+            .payees
+            .iter()
+            .position(|k| k == &payee_key)
+            .ok_or(PaymentSplitterError::PayeeNotFound)?;
 
-    let total_shares: u128 = ps.shares_amounts.iter().map(|s| *s as u128).sum();
-    let total_released: u128 = ps.released_amounts.iter().map(|r| *r as u128).sum();
-    let total_received: u128 = (ps.current_lamports as u128)
-        .checked_add(total_released)
-        .ok_or(PaymentSplitterError::Overflow)?;
-    let entitled = total_received
-        .checked_mul(ps.shares_amounts[idx] as u128)
-        .ok_or(PaymentSplitterError::Overflow)?
-        .checked_div(total_shares)
-        .ok_or(PaymentSplitterError::DivideByZero)?;
-    let already_released = ps.released_amounts[idx] as u128;
-    if entitled <= already_released {
-        return err!(PaymentSplitterError::NothingToRelease);
+        let total_shares: u128 = ps.shares_amounts.iter().map(|s| *s as u128).sum();
+        let total_released: u128 = ps.released_amounts.iter().map(|r| *r as u128).sum();
+        let total_received: u128 = (ps.current_lamports as u128)
+            .checked_add(total_released)
+            .ok_or(PaymentSplitterError::Overflow)?;
+        let entitled = total_received
+            .checked_mul(ps.shares_amounts[idx] as u128)
+            .ok_or(PaymentSplitterError::Overflow)?
+            .checked_div(total_shares)
+            .ok_or(PaymentSplitterError::DivideByZero)?;
+        let already_released = ps.released_amounts[idx] as u128;
+        if entitled <= already_released {
+            return err!(PaymentSplitterError::NothingToRelease);
+        }
+        let to_release = (entitled - already_released) as u64;
+
+        require!(
+            ps.current_lamports >= to_release,
+            PaymentSplitterError::InsufficientPdaBalance
+        );
+
+        // -------------------------------
+        // Manual lamports transfer
+        // -------------------------------
+        let ps_ai = ps.to_account_info(); // ✅ use mutable ref
+        let payee_ai = ctx.accounts.payee.to_account_info();
+
+        **ps_ai.try_borrow_mut_lamports()? -= to_release;
+        **payee_ai.try_borrow_mut_lamports()? += to_release;
+
+        ps.released_amounts[idx] = ps
+            .released_amounts[idx]
+            .checked_add(to_release)
+            .ok_or(PaymentSplitterError::Overflow)?;
+        ps.current_lamports = ps
+            .current_lamports
+            .checked_sub(to_release)
+            .ok_or(PaymentSplitterError::Overflow)?;
+
+        Ok(())
     }
-    let to_release = (entitled - already_released) as u64;
-
-    require!(
-        ps.current_lamports >= to_release,
-        PaymentSplitterError::InsufficientPdaBalance
-    );
-
-    // -------------------------------
-    // Manual lamports transfer
-    // -------------------------------
-    let ps_ai = ps.to_account_info(); // ✅ use mutable ref
-    let payee_ai = ctx.accounts.payee.to_account_info();
-
-    **ps_ai.try_borrow_mut_lamports()? -= to_release;
-    **payee_ai.try_borrow_mut_lamports()? += to_release;
-
-    ps.released_amounts[idx] = ps
-        .released_amounts[idx]
-        .checked_add(to_release)
-        .ok_or(PaymentSplitterError::Overflow)?;
-    ps.current_lamports = ps
-        .current_lamports
-        .checked_sub(to_release)
-        .ok_or(PaymentSplitterError::Overflow)?;
-
-    Ok(())
-}
-
 }
 
 // ---------------------------------
@@ -161,7 +160,6 @@ pub struct ReleaseCtx<'info> {
 
     pub system_program: Program<'info, System>,
 }
-
 
 // ---------------------------------
 // Account Data

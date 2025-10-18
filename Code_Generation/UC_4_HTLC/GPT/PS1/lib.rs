@@ -3,32 +3,30 @@ use anchor_lang::solana_program::{keccak};
 
 declare_id!("8JTGYRpj23beoJ6JqXC3aGnSTEV6vvTDVNzQvUzYGzr9");
 
-
 #[program]
 pub mod htlc {
     use super::*;
 
     /// Initialize a new HTLC
     pub fn initialize(
-    ctx: Context<InitializeCtx>,
-    hashed_secret: [u8; 32],
-    delay: u64,
-    amount: u64,
-) -> Result<()> {
-    let htlc = &mut ctx.accounts.htlc_info;
+        ctx: Context<InitializeCtx>,
+        hashed_secret: [u8; 32],
+        delay: u64,
+        amount: u64,
+    ) -> Result<()> {
+        let htlc = &mut ctx.accounts.htlc_info;
 
-    htlc.owner = ctx.accounts.owner.key();
-    htlc.verifier = ctx.accounts.verifier.key();
-    htlc.hashed_secret = hashed_secret;
-    let current_slot = Clock::get()?.slot;
-    htlc.reveal_timeout = current_slot + delay;
-    htlc.amount = amount;
+        htlc.owner = ctx.accounts.owner.key();
+        htlc.verifier = ctx.accounts.verifier.key();
+        htlc.hashed_secret = hashed_secret;
+        let current_slot = Clock::get()?.slot;
+        htlc.reveal_timeout = current_slot + delay;
+        htlc.amount = amount;
 
-    // NO manual lamports transfer needed!
-    // The `init` attribute already funds the PDA with enough lamports from `owner`
-    Ok(())
-}
-
+        // NO manual lamports transfer needed!
+        // The `init` attribute already funds the PDA with enough lamports from `owner`
+        Ok(())
+    }
 
     /// Reveal the secret to claim HTLC funds
     pub fn reveal(ctx: Context<RevealCtx>, secret: String) -> Result<()> {

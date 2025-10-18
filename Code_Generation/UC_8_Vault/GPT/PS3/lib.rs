@@ -93,20 +93,19 @@ pub mod vault {
         let available = vault_ai.lamports().saturating_sub(rent_exempt);
         require!(amount <= available, VaultError::InsufficientFunds);
 
-{
-    let mut vault_lamports_ref = vault_ai.try_borrow_mut_lamports()?;
-    **vault_lamports_ref = vault_lamports_ref
-        .checked_sub(amount)
-        .ok_or(VaultError::InsufficientFunds)?;
-    drop(vault_lamports_ref);
+        {
+            let mut vault_lamports_ref = vault_ai.try_borrow_mut_lamports()?;
+            **vault_lamports_ref = vault_lamports_ref
+                .checked_sub(amount)
+                .ok_or(VaultError::InsufficientFunds)?;
+            drop(vault_lamports_ref);
 
-    let receiver_ai = ctx.accounts.receiver.to_account_info(); // keep it alive
-    let mut receiver_lamports_ref = receiver_ai.try_borrow_mut_lamports()?;
-    **receiver_lamports_ref = receiver_lamports_ref
-        .checked_add(amount)
-        .ok_or(VaultError::ArithmeticOverflow)?;
-}
-
+            let receiver_ai = ctx.accounts.receiver.to_account_info(); // keep it alive
+            let mut receiver_lamports_ref = receiver_ai.try_borrow_mut_lamports()?;
+            **receiver_lamports_ref = receiver_lamports_ref
+                .checked_add(amount)
+                .ok_or(VaultError::ArithmeticOverflow)?;
+        }
 
         vault.state = State::Idle;
         vault.amount = 0;

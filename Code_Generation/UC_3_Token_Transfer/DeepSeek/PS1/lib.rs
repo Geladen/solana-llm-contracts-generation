@@ -10,7 +10,6 @@ use anchor_spl::{
 
 declare_id!("FyPxqSXCggZdgi4DriTNmNVjAU5A8BYrwmZDQ1WAu3Xs");
 
-
 #[program]
 pub mod token_transfer {
     use super::*;
