@@ -1,4 +1,4 @@
-# Code Metrics Report
+# Generation Metrics Report
 
 | Metric                          | Value     |
 |---------------------------------|-----------|

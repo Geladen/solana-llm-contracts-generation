@@ -1,8 +1,9 @@
 ## Identified Hallucinations
 
-### [Dead Code]
+### Context Devition: Dead Code
 **Description:** 
-never used function
+
+The program defines unix_timestamp_now function that is never called.
 
 **Code Example:**
 ```rust
@@ -14,6 +15,8 @@ fn unix_timestamp_now() -> Result<u64> {
     }
     Ok(ts_i64 as u64)
 }
+```
 
+**CrystalBLEU similarity: 0.165** 
 
 

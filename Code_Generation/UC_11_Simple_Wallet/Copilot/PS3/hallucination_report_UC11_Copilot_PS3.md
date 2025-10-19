@@ -1,11 +1,14 @@
 ## Identified Hallucinations
 
-### [KNOWLEDGE CONFLICTING -  API KNOWLEDGE]
+### Knowledge Conflicting: API Knowledge
 **Description:** 
-use of deprecated module system_instruction
+
+The code uses a deprecated import.
 
 **Code Example:**
 ```rust
 use anchor_lang::solana_program::{program::invoke_signed, system_instruction};
+```
 
+**CrystalBLEU similarity: 0.237** 
 

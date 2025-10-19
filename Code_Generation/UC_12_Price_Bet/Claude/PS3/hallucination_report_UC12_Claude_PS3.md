@@ -1,8 +1,8 @@
 ## Identified Hallucinations
 
-### [KNOWLEDGE CONFLICTING- API KNOWLEDGE]
+### Knowledge Conflicting: API Knowledge
 **Description:** 
-unused import std::str::FromStr and deprecated module pyth_sdk_solana::load_price_feed_from_account_info
+Unused import std::str::FromStr and deprecated module pyth_sdk_solana::load_price_feed_from_account_info.
 
 **Code Example:**
 ```rust
@@ -10,5 +10,6 @@ use pyth_sdk_solana::load_price_feed_from_account_info;
 use std::str::FromStr;
 ```
 
+**CrystalBLEU similarity: 0.312** 
 
 

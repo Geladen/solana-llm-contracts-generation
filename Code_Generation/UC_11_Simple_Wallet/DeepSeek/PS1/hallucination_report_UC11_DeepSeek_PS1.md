@@ -1,8 +1,9 @@
 ## Identified Hallucinations
 
-### [Dead Code]
+### Context Devition: Dead Code
 **Description:** 
-unused parameter transaction_seed
+
+The transaction_seed parameter is declared in the function signature but never utilized within the function's logic.
 
 **Code Example:**
 ```rust
@@ -14,3 +15,4 @@ pub fn create_transaction(
         require!(transaction_lamports_amount > 0, WalletError::InvalidAmount);
 ```
 
+**CrystalBLEU similarity: 0.314** 
