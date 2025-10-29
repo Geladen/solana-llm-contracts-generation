@@ -3,10 +3,10 @@
 ### Context Deviation: Inconsistency
 **Description:** 
 
-Inconsistent memory management
+Funds distribution error at vesting completion.
 
 **Code Example:**
 ```rust
 ```
 
-**CrystalBLEU similarity: 0.341** 
+**CrystalBLEU similarity: 0.195** 
