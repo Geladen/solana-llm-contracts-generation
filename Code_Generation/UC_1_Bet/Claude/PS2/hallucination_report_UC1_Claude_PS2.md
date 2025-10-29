@@ -1,6 +1,6 @@
 ## Identified Hallucinations
 
-### Context Devition: Dead Code
+### Context Deviation: Dead Code
 **Description:** 
 
 The Anchor program creates `signer_seeds` variables in both `win` and `timeout` functions but never utilizes them for PDA signing in subsequent operations.

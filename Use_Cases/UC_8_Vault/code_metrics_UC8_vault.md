@@ -6,5 +6,5 @@
 | **Comments per Line**           | 0,05 - (10) |
 | **Declared Functions**          | 4           |
 | **Lines per function**          | 21          |
-
+| **Max Cyclomatic Complexity**   | 4           |
 

@@ -2,7 +2,8 @@
 
 ### Knowledge Conflicting: Identifier knowledge
 **Description:** 
-This program incorrectly uses `system_program::transfer` on a PDA that carries data, violating Solana's constraint that accounts with non-zero data cannot be used as the 'from' account in system transfers.
+
+This program incorrectly uses system_program::transfer on a PDA that carries data, violating Solana's constraint that accounts with non-zero data cannot be used as the 'from' account in system transfers.
 
 **Code Example:**
 ```rust
