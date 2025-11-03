@@ -1,6 +1,7 @@
+#![allow(unexpected_cfgs)]
 use anchor_lang::prelude::*;
 
-declare_id!("Dxp12CD5ndCP3MuLCmGt4N9GaKVSgzBpHKKmSg6R8hpR");
+declare_id!("75iGkEMwSdRuoFRa2ZHnPrviHK3g8WrCQQ9WbgHefc8J");
 
 #[program]
 pub mod vesting {
@@ -13,277 +14,247 @@ pub mod vesting {
         lamports_amount: u64,
     ) -> Result<()> {
         let clock = Clock::get()?;
-        require!(start_slot >= clock.slot, VestingError::StartSlotInPast);
-        require!(duration > 0, VestingError::ZeroDuration);
+        let current_slot = clock.slot;
 
-        let vest = &mut ctx.accounts.vesting_info;
-        vest.released = 0;
-        vest.funder = ctx.accounts.funder.key();
-        vest.beneficiary = ctx.accounts.beneficiary.key();
-        vest.start_slot = start_slot;
-        vest.duration = duration;
+        // Validate that start slot is not in the past
+        require!(start_slot >= current_slot, VestingError::InvalidStartSlot);
 
-        // Transfer lamports_amount from funder to the PDA (destination may be program-owned)
-        let ix = anchor_lang::solana_program::system_instruction::transfer(
-            &ctx.accounts.funder.key(),
-            &ctx.accounts.vesting_info.key(),
-            lamports_amount,
+        // Validate duration is positive
+        require!(duration > 0, VestingError::InvalidDuration);
+
+        // Validate amount is positive
+        require!(lamports_amount > 0, VestingError::InvalidAmount);
+
+        let vesting_info = &mut ctx.accounts.vesting_info;
+
+        // Initialize vesting account data
+        vesting_info.released = 0;
+        vesting_info.funder = ctx.accounts.funder.key();
+        vesting_info.beneficiary = ctx.accounts.beneficiary.key();
+        vesting_info.start_slot = start_slot;
+        vesting_info.duration = duration;
+
+        // Transfer lamports from funder to vesting PDA
+        let transfer_instruction = anchor_lang::system_program::Transfer {
+            from: ctx.accounts.funder.to_account_info(),
+            to: ctx.accounts.vesting_info.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            transfer_instruction,
         );
-        anchor_lang::solana_program::program::invoke(
-            &ix,
-            &[
-                ctx.accounts.funder.to_account_info(),
-                ctx.accounts.vesting_info.to_account_info(),
-            ],
-        )?;
+
+        anchor_lang::system_program::transfer(cpi_ctx, lamports_amount)?;
+
+        msg!(
+            "Vesting initialized: {} SOL over {} slots starting at slot {}",
+            lamports_amount as f64 / 1_000_000_000.0,
+            duration,
+            start_slot
+        );
 
         Ok(())
     }
 
     pub fn release(ctx: Context<ReleaseCtx>) -> Result<()> {
-        // Clone AccountInfo values first to avoid overlapping borrows
-        let vesting_ai = ctx.accounts.vesting_info.to_account_info();
-        let beneficiary_ai = ctx.accounts.beneficiary.to_account_info();
-        let funder_ai = ctx.accounts.funder.to_account_info();
-
-        // Read-only state
         let clock = Clock::get()?;
-        let rent = Rent::get()?;
-        let rent_min = rent.minimum_balance(VestingInfo::LEN);
+        let current_slot = clock.slot;
 
-        // Read current lamports before taking mutable typed borrow
-        let current_balance = vesting_ai.lamports();
+        // Read vesting info data first to avoid borrowing conflicts
+        let start_slot = ctx.accounts.vesting_info.start_slot;
+        let duration = ctx.accounts.vesting_info.duration;
+        let already_released = ctx.accounts.vesting_info.released;
+        let current_lamports = ctx.accounts.vesting_info.to_account_info().lamports();
 
-        // Mutable typed borrow of VestingInfo
-        let vest_acc = &mut ctx.accounts.vesting_info;
+        // Calculate total amount (current balance + already released)
+        let total_amount = current_lamports + already_released;
 
-        // Compute total deposited (excluding rent)
-        let released_before = vest_acc.released;
-        let total_deposit = current_balance
-            .checked_add(released_before)
-            .and_then(|v| v.checked_sub(rent_min))
-            .ok_or(VestingError::ArithmeticOverflow)?;
+        // Calculate total vested amount based on current slot
+        let total_vested = calculate_vested_amount(
+            start_slot,
+            duration,
+            current_slot,
+            total_amount,
+        );
 
-        // Compute vested so far (128-bit intermediate)
-        let vested_so_far: u128 = if clock.slot < vest_acc.start_slot {
-            0
-        } else if vest_acc.duration == 0
-            || clock.slot >= vest_acc.start_slot.saturating_add(vest_acc.duration)
-        {
-            total_deposit as u128
-        } else {
-            let passed = clock.slot.saturating_sub(vest_acc.start_slot) as u128;
-            let dur = vest_acc.duration as u128;
-            (total_deposit as u128)
-                .checked_mul(passed)
-                .and_then(|v| v.checked_div(dur))
-                .ok_or(VestingError::ArithmeticOverflow)?
-        };
+        // Calculate releasable amount (total vested minus already released)
+        let releasable = total_vested.saturating_sub(already_released);
 
-        let vested_so_far_u64: u64 =
-            vested_so_far.try_into().map_err(|_| VestingError::ArithmeticOverflow)?;
-        let releasable = vested_so_far_u64.checked_sub(released_before).unwrap_or(0);
-
-        if releasable == 0 {
-            return Ok(());
-        }
-
-        // Compute PDA available to withdraw without touching rent
-        let pda_balance = vesting_ai.lamports();
-        let available_to_withdraw = if pda_balance > rent_min {
-            pda_balance - rent_min
-        } else {
-            0u64
-        };
-
-        // Determine how much to transfer to beneficiary now (never touch rent)
-        let transfer_amount = if releasable > available_to_withdraw {
-            available_to_withdraw
-        } else {
+        msg!(
+            "Total vested: {}, Already released: {}, Releasable: {}",
+            total_vested,
+            already_released,
             releasable
-        };
+        );
 
-        if transfer_amount == 0 {
+        // If no funds to release, return early
+        if releasable == 0 {
+            msg!("No funds available for release at this time");
             return Ok(());
         }
 
-        // Perform the transfer by mutating lamports (program owns the PDA)
-        {
-            let mut from_lamports = vesting_ai.try_borrow_mut_lamports()?;
-            let mut to_lamports = beneficiary_ai.try_borrow_mut_lamports()?;
+        // Check if this release would fully vest all funds
+        let is_fully_vested = total_vested >= total_amount;
 
-            let from_val: u64 = **from_lamports;
-            let to_val: u64 = **to_lamports;
-
-            if from_val < transfer_amount {
-                return Err(error!(VestingError::InsufficientFunds));
-            }
-
-            let new_from = from_val
-                .checked_sub(transfer_amount)
+        if is_fully_vested {
+            // Full release - transfer vested funds to beneficiary and account rent to funder
+            let vesting_account_info = ctx.accounts.vesting_info.to_account_info();
+            let funder_account_info = ctx.accounts.funder.to_account_info();
+            
+            // Get the minimum rent for the account (this is what should be returned to funder)
+            let rent = Rent::get()?;
+            let account_rent = rent.minimum_balance(vesting_account_info.data_len());
+            
+            // Calculate the actual vested funds (total lamports minus account rent)
+            let vested_funds = current_lamports.saturating_sub(account_rent);
+            
+            // Transfer vested funds to beneficiary
+            **ctx.accounts.beneficiary.try_borrow_mut_lamports()? = ctx
+                .accounts
+                .beneficiary
+                .lamports()
+                .checked_add(vested_funds)
                 .ok_or(VestingError::ArithmeticOverflow)?;
-            let new_to = to_val
-                .checked_add(transfer_amount)
+            
+            // Transfer account rent back to funder
+            **funder_account_info.try_borrow_mut_lamports()? = funder_account_info
+                .lamports()
+                .checked_add(account_rent)
+                .ok_or(VestingError::ArithmeticOverflow)?;
+            
+            // Zero out the vesting account
+            **vesting_account_info.try_borrow_mut_lamports()? = 0;
+
+            msg!("Vesting completed: {} SOL released to beneficiary, {} SOL rent returned to funder", 
+                 vested_funds as f64 / 1_000_000_000.0,
+                 account_rent as f64 / 1_000_000_000.0);
+        } else {
+            // Partial release
+            **ctx.accounts.vesting_info.to_account_info().try_borrow_mut_lamports()? = current_lamports
+                .checked_sub(releasable)
+                .ok_or(VestingError::InsufficientFunds)?;
+
+            **ctx.accounts.beneficiary.try_borrow_mut_lamports()? = ctx
+                .accounts
+                .beneficiary
+                .lamports()
+                .checked_add(releasable)
                 .ok_or(VestingError::ArithmeticOverflow)?;
 
-            **from_lamports = new_from;
-            **to_lamports = new_to;
+            // Update released amount
+            ctx.accounts.vesting_info.released = already_released
+                .checked_add(releasable)
+                .ok_or(VestingError::ArithmeticOverflow)?;
+
+            msg!("Partial release: {} SOL released to beneficiary", 
+                 releasable as f64 / 1_000_000_000.0);
         }
 
-        // Update released by the actual transferred amount
-        vest_acc.released = vest_acc
-            .released
-            .checked_add(transfer_amount)
-            .ok_or(VestingError::ArithmeticOverflow)?;
-
-        // Recompute remaining_deposit = total_deposit - released
-        let remaining_deposit = total_deposit
-            .checked_sub(vest_acc.released)
-            .ok_or(VestingError::ArithmeticOverflow)?;
-
-        // If fully vested (i.e., nothing remains), finalize: move any remaining lamports (including rent) to funder and zero data
-        if remaining_deposit == 0 {
-            {
-                // move all remaining lamports in PDA to funder
-                let mut from_lamports = vesting_ai.try_borrow_mut_lamports()?;
-                let mut to_lamports = funder_ai.try_borrow_mut_lamports()?;
-
-                let amount: u64 = **from_lamports;
-                if amount > 0 {
-                    **from_lamports = 0u64;
-                    **to_lamports = (**to_lamports)
-                        .checked_add(amount)
-                        .ok_or(VestingError::ArithmeticOverflow)?;
-                }
-            }
-
-            // Zero PDA data
-            {
-                let mut data = vesting_ai.data.borrow_mut();
-                for byte in data.iter_mut() {
-                    *byte = 0;
-                }
-            }
-
-            // Ensure released equals total_deposit
-            vest_acc.released = total_deposit;
-        }
-
-        Ok(())
-    }
-
-    /// Optional explicit close (keeps compatibility): ensures fully released and closes via Anchor
-    pub fn close_vesting(ctx: Context<CloseCtx>) -> Result<()> {
-        let vest = &ctx.accounts.vesting_info;
-        let vesting_ai = ctx.accounts.vesting_info.to_account_info();
-        let rent = Rent::get()?;
-        let rent_min = rent.minimum_balance(VestingInfo::LEN);
-        let current_balance = vesting_ai.lamports();
-
-        let total_deposit = current_balance
-            .checked_add(vest.released)
-            .and_then(|v| v.checked_sub(rent_min))
-            .ok_or(VestingError::ArithmeticOverflow)?;
-
-        require!(vest.released == total_deposit, VestingError::NotFullyReleased);
         Ok(())
     }
 }
 
+// Helper function to calculate vested amount based on linear vesting
+fn calculate_vested_amount(
+    start_slot: u64,
+    duration: u64,
+    current_slot: u64,
+    total_amount: u64,
+) -> u64 {
+    // If before start, nothing is vested
+    if current_slot < start_slot {
+        return 0;
+    }
+
+    // If after vesting period, everything is vested
+    let end_slot = start_slot.saturating_add(duration);
+    if current_slot >= end_slot {
+        return total_amount;
+    }
+
+    // Calculate linear vesting progress
+    let elapsed_slots = current_slot.saturating_sub(start_slot);
+    
+    // Use checked arithmetic to prevent overflow
+    let vested_amount = (total_amount as u128)
+        .checked_mul(elapsed_slots as u128)
+        .and_then(|x| x.checked_div(duration as u128))
+        .and_then(|x| x.try_into().ok())
+        .unwrap_or(0);
+
+    vested_amount
+}
+
 #[derive(Accounts)]
-#[instruction(start_slot: u64, duration: u64, lamports_amount: u64)]
 pub struct InitializeCtx<'info> {
-    /// Funder must sign and pay for initialization
     #[account(mut)]
     pub funder: Signer<'info>,
-
-    /// CHECK: beneficiary is only used as a Pubkey seed for the vesting PDA and stored in VestingInfo;
-    /// no data from this account is read or trusted during instruction execution, so a runtime check is unnecessary.
+    
+    /// CHECK: This account is only used as a reference for the beneficiary
     pub beneficiary: UncheckedAccount<'info>,
-
-    /// Vesting PDA with exact seed [beneficiary.key().as_ref()]
+    
     #[account(
         init,
-        seeds = [beneficiary.key().as_ref()],
-        bump,
         payer = funder,
-        space = VestingInfo::LEN
+        space = 8 + VestingInfo::INIT_SPACE,
+        seeds = [beneficiary.key().as_ref()],
+        bump
     )]
     pub vesting_info: Account<'info, VestingInfo>,
-
+    
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct ReleaseCtx<'info> {
-    /// Beneficiary must sign to release vested funds
     #[account(mut)]
     pub beneficiary: Signer<'info>,
-
-    /// CHECK: funder is only stored in VestingInfo and may receive funds on finalization;
-    /// we don't read or trust any data from this account during release, so a runtime check is unnecessary.
+    
+    /// CHECK: This account is used to verify funder and potentially return rent
     #[account(mut)]
     pub funder: UncheckedAccount<'info>,
-
-    /// Vesting PDA; seeds exactly [beneficiary.key().as_ref()]
+    
     #[account(
         mut,
         seeds = [beneficiary.key().as_ref()],
         bump,
-        has_one = beneficiary,
-        has_one = funder
-    )]
-    pub vesting_info: Account<'info, VestingInfo>,
-
-    pub system_program: Program<'info, System>,
-}
-
-/// Close context uses Anchor's `close = funder` so rent is returned automatically when instruction returns.
-#[derive(Accounts)]
-pub struct CloseCtx<'info> {
-    /// Beneficiary must sign to close (keeps same security model)
-    #[account(mut)]
-    pub beneficiary: Signer<'info>,
-
-    /// CHECK: funder is the recipient of returned rent when the vesting_info account is closed.
-    #[account(mut)]
-    pub funder: UncheckedAccount<'info>,
-
-    /// Vesting PDA with exact seed [beneficiary.key().as_ref()]
-    #[account(
-        mut,
-        seeds = [beneficiary.key().as_ref()],
-        bump,
-        has_one = beneficiary,
-        has_one = funder,
-        close = funder
+        constraint = vesting_info.beneficiary == beneficiary.key() @ VestingError::InvalidBeneficiary,
+        constraint = vesting_info.funder == funder.key() @ VestingError::InvalidFunder
     )]
     pub vesting_info: Account<'info, VestingInfo>,
 }
 
 #[account]
+#[derive(InitSpace)]
 pub struct VestingInfo {
-    pub released: u64,
-    pub funder: Pubkey,
-    pub beneficiary: Pubkey,
-    pub start_slot: u64,
-    pub duration: u64,
-}
-
-impl VestingInfo {
-    pub const LEN: usize = 8 + 8 + 32 + 32 + 8 + 8;
+    pub released: u64,      // Amount already released to beneficiary
+    pub funder: Pubkey,     // Address of the funder
+    pub beneficiary: Pubkey, // Address of the beneficiary
+    pub start_slot: u64,    // Slot when vesting starts
+    pub duration: u64,      // Duration of vesting in slots
 }
 
 #[error_code]
 pub enum VestingError {
-    #[msg("Start slot must be in the future or current slot.")]
-    StartSlotInPast,
-    #[msg("Zero duration not allowed.")]
-    ZeroDuration,
-    #[msg("Arithmetic overflow or underflow occurred.")]
-    ArithmeticOverflow,
-    #[msg("Insufficient funds in vesting account.")]
+    #[msg("Start slot cannot be in the past")]
+    InvalidStartSlot,
+    
+    #[msg("Duration must be greater than zero")]
+    InvalidDuration,
+    
+    #[msg("Amount must be greater than zero")]
+    InvalidAmount,
+    
+    #[msg("Invalid beneficiary")]
+    InvalidBeneficiary,
+    
+    #[msg("Invalid funder")]
+    InvalidFunder,
+    
+    #[msg("Insufficient funds in vesting account")]
     InsufficientFunds,
-    #[msg("Vesting not fully released")]
-    NotFullyReleased,
+    
+    #[msg("Arithmetic overflow")]
+    ArithmeticOverflow,
 }
