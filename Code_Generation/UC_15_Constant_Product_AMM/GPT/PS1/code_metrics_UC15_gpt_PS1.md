@@ -5,6 +5,6 @@
 | **Lines of Code**               | 400         |
 | **Comments per Line**           | 0,07 - (29) |
 | **Declared Functions**          | 6           |
-| **Lines per function**          |         |
+| **Lines per function**          | 42.16       |
 
 

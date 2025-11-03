@@ -134,7 +134,6 @@ pub mod constant_product_amm {
         Ok(())
     }
 
-
     // redeem(): compute proportional outputs in COMMON_DECIMALS and transfer raw units
     pub fn redeem(ctx: Context<RedeemOrSwapCtx>, amount: u64) -> Result<()> {
         // validations

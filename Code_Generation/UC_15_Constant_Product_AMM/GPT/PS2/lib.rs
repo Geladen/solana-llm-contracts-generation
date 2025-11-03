@@ -83,7 +83,6 @@ pub mod amm_gpt {
         Ok(liquidity)
     }
 
-
     pub fn redeem(ctx: Context<Redeem>, amount: u64) -> Result<(u64, u64)> {
         let amm = &mut ctx.accounts.amm_info;
 
