@@ -48,3 +48,20 @@ Reject transactions where:
 -The state is already finalized (e.g., already resolved)
 ```
 
+
+5. List of Packages Technique
+Purpose: To limit the scope of the AI's knowledge to specific crates and versions, ensuring the code is generated with the correct syntax and available methods.
+How to do it: Explicitly state which crates and modules the contract can use.
+
+```
+The smart contract has access to the following packages:
+anchor_lang::prelude::*
+anchor_spl::token::*
+```
+
+6. Chain-of-Thought Technique
+Purpose: To prime the AI to generate a more thoughtful and complete solution by encouraging a logical construction process rather than a rushed output.
+
+```
+Let's think step by step to construct the complete code based on the description. 
+```
