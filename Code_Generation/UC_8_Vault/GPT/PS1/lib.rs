@@ -61,7 +61,6 @@ pub mod vault {
         // mutate
         vault.receiver = ctx.accounts.receiver.key();
         vault.request_time = Clock::get()?.slot;
-    ;
         vault.amount = amount;
         vault.state = State::Req;
 
