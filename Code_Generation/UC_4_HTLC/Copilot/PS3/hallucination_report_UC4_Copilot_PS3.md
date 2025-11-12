@@ -12,7 +12,7 @@ use anchor_lang::solana_program::system_instruction;
 ### Context Deviation: Inconsistency
 **Description:** 
 
-The reveal function incorrectly allows execution at the exact deadline slot, creating a timing conflict with the timeout function
+The reveal function permits execution at the deadline slot, causing a conflict with timeout.
 
 **Code Example:**
 ```rust

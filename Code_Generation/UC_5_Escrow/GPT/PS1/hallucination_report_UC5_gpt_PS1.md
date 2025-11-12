@@ -3,7 +3,7 @@
 ### Intent Conflicting
 **Description:** 
 
-Model generated struct name Initialize instead of InitializeCtx, deviating from explicit naming instructions in the prompt.
+The program produced a struct named Initialize instead of InitializeCtx, which does not comply with the explicit naming instructions in the prompt.
 
 **Code Example:**
 ```rust
