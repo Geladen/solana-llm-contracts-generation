@@ -3,7 +3,7 @@
 ### Knowledge Conflicting: API Knowledge
 **Description:** 
 
-Use of deprecated module system_instruction and unused import anchor_lang::system_program
+The program uses the deprecated module system_instruction and includes an unused import anchor_lang::system_program.
 
 **Code Example:**
 ```rust
