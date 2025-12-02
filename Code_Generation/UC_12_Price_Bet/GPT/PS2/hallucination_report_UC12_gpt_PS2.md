@@ -2,12 +2,17 @@
 
 ### Knowledge Conflicting: API Knowledge
 **Description:** 
-
-The code uses a deprecated import.
+unused import invoke_signed, PriceStatus and deprecated module pyth_sdk_solana::load_price_feed_from_account_info.
 
 **Code Example:**
 ```rust
-use pyth_sdk_solana::load_price_feed_from_account_info;
+use anchor_lang::solana_program::{
+    program::invoke_signed,
+    system_instruction,
+};
+use pyth_sdk_solana::{load_price_feed_from_account_info, state::PriceStatus};
 ```
 
-**CrystalBLEU similarity: 0.156** 
+**CrystalBLEU similarity: 0.258** 
+
+

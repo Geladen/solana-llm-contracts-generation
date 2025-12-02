@@ -1,180 +1,154 @@
 use anchor_lang::prelude::*;
-use anchor_lang::system_program;
-use pyth_sdk_solana::load_price_feed_from_account_info;
-use std::str::FromStr;
+use anchor_lang::solana_program::{
+    program::invoke_signed,
+    system_instruction,
+};
+use pyth_sdk_solana::{load_price_feed_from_account_info, state::PriceStatus};
 
-declare_id!("3sG19eiLedgp2pxAyTyimSt1bMTboiPrJ6SiGMA9Qw1N");
-
-// Staleness threshold in seconds for Pyth prices
-const STALENESS_THRESHOLD_SECONDS: u64 = 60;
-
-// -- NOTE: This program validates the Pyth oracle account owner against the well-known
-// mainnet Pyth program ID. If you deploy to devnet/testnet or use a different Pyth program,
-// replace this string with the correct program id for that cluster.
-const PYTH_MAINNET_PROGRAM_ID_STR: &str = "3sG19eiLedgp2pxAyTyimSt1bMTboiPrJ6SiGMA9Qw1N";
+declare_id!("2gF69apd5jKyZuxKMLfwQqLyLBT8xJBhTuTw14tVhirb");
 
 #[program]
 pub mod price_bet {
     use super::*;
 
-    /// init: called by owner (signer)
-    /// - delay: number of seconds from now until deadline
-    /// - wager: lamports the owner deposits as the initial pot
-    /// - rate: target rate (IN PYTH RAW PRICE UNITS — see notes)
+    /// Owner initializes a bet and deposits their wager into the PDA.
     pub fn init(ctx: Context<InitCtx>, delay: u64, wager: u64, rate: u64) -> Result<()> {
         let clock = Clock::get()?;
-        let now = clock.unix_timestamp as u64;
-        let deadline = now.checked_add(delay).ok_or(ErrorCode::ArithmeticOverflow)?;
+        let deadline = clock.unix_timestamp as u64 + delay;
 
-        // Fill struct fields
-        {
-            let bet = &mut ctx.accounts.bet_info;
-            bet.owner = ctx.accounts.owner.key();
-            bet.player = Pubkey::default();
-            bet.wager = wager;
-            bet.deadline = deadline;
-            bet.rate = rate;
-        }
+        let bet = &mut ctx.accounts.bet_info;
+        bet.owner = *ctx.accounts.owner.key;
+        bet.player = Pubkey::default();
+        bet.wager = wager;
+        bet.deadline = deadline;
+        bet.rate = rate;
+        bet.bump = ctx.bumps.bet_info;
 
-        // Transfer after dropping the mutable borrow
-        let cpi_accounts = anchor_lang::system_program::Transfer {
-            from: ctx.accounts.owner.to_account_info(),
-            to: ctx.accounts.bet_info.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
-        system_program::transfer(cpi_ctx, wager)?;
-
-        msg!(
-            "Init: owner {} created bet PDA {} with wager {} lamports, deadline {} (unix)",
-            ctx.accounts.owner.key(),
-            ctx.accounts.bet_info.key(),
+        // Transfer wager lamports from owner to PDA
+        let ix = system_instruction::transfer(
+            ctx.accounts.owner.key,
+            ctx.accounts.bet_info.to_account_info().key,
             wager,
-            deadline
         );
+        anchor_lang::solana_program::program::invoke(
+            &ix,
+            &[
+                ctx.accounts.owner.to_account_info(),
+                ctx.accounts.bet_info.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
 
         Ok(())
     }
 
-    /// join: called by the player (signer)
-    /// - player transfers a matching wager to the bet PDA
+    /// Player joins by matching the owner's wager.
     pub fn join(ctx: Context<JoinCtx>) -> Result<()> {
-        let clock = Clock::get()?;
-        let now = clock.unix_timestamp as u64;
-
-        // Immutable borrow for checks
-        {
-            let bet = &ctx.accounts.bet_info;
-            require!(bet.player == Pubkey::default(), ErrorCode::AlreadyHasPlayer);
-            require!(ctx.accounts.player.key() != bet.owner, ErrorCode::PlayerIsOwner);
-            require!(now < bet.deadline, ErrorCode::BetAlreadyExpired);
-        }
-
         let wager = ctx.accounts.bet_info.wager;
 
-        // Transfer player's matching wager
-        let cpi_accounts = anchor_lang::system_program::Transfer {
-            from: ctx.accounts.player.to_account_info(),
-            to: ctx.accounts.bet_info.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
-        system_program::transfer(cpi_ctx, wager)?;
+        // require not already joined
+        require!(ctx.accounts.bet_info.player == Pubkey::default(), BetError::AlreadyJoined);
 
-        // Now mutate the account
-        ctx.accounts.bet_info.player = ctx.accounts.player.key();
+        // require before deadline
+        let clock = Clock::get()?;
+        require!((clock.unix_timestamp as u64) < ctx.accounts.bet_info.deadline, BetError::DeadlinePassed);
 
-        msg!(
-            "Join: player {} joined bet {} by owner {} (wager {}).",
-            ctx.accounts.player.key(),
-            ctx.accounts.bet_info.key(),
-            ctx.accounts.owner.key(),
-            wager
+        // transfer from player to PDA
+        let ix = system_instruction::transfer(
+            ctx.accounts.player.key,
+            ctx.accounts.bet_info.to_account_info().key,
+            wager,
         );
+        anchor_lang::solana_program::program::invoke(
+            &ix,
+            &[
+                ctx.accounts.player.to_account_info(),
+                ctx.accounts.bet_info.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+
+        // record player after transfer
+        let bet = &mut ctx.accounts.bet_info;
+        bet.player = *ctx.accounts.player.key;
 
         Ok(())
     }
 
-    /// win: called by the player (signer) after the deadline (player claims if price condition met)
-    /// * validates Pyth feed account owner and staleness (uses `load_price_feed_from_account_info`).
-    /// * On success, Anchor `close = player` for bet_info ensures all lamports are sent to player and the PDA is closed.
-    #[access_control(player_is_signer(&ctx.accounts.player))]
+    /// Player claims pot if price condition satisfied.
     pub fn win(ctx: Context<WinCtx>) -> Result<()> {
+        let clock = Clock::get()?;
         let bet = &ctx.accounts.bet_info;
 
-        // only the recorded player can call win
-        require!(bet.player == ctx.accounts.player.key(), ErrorCode::NotPlayer);
-
-        // ensure bet expired (deadline reached)
-        let clock = Clock::get()?;
-        let now = clock.unix_timestamp as u64;
-        require!(now >= bet.deadline, ErrorCode::BetNotExpired);
-
-        // Validate the price feed account owner (basic oracle ownership check)
-        let pyth_prog_pubkey = Pubkey::from_str(PYTH_MAINNET_PROGRAM_ID_STR)
-            .map_err(|_| error!(ErrorCode::InvalidOracleAccount))?;
+        // Reject if deadline has passed
         require!(
-            ctx.accounts.price_feed.owner == &pyth_prog_pubkey,
-            ErrorCode::InvalidOracleAccount
+            (clock.unix_timestamp as u64) < bet.deadline,
+            BetError::DeadlinePassed
         );
 
-        // Load the PriceFeed and get a recent price (staleness checked)
+        // Check that the player matches
+        require!(
+            bet.player == *ctx.accounts.player.key,
+            BetError::UnauthorizedPlayer
+        );
+
+        // Load Pyth price feed safely
         let price_feed = load_price_feed_from_account_info(&ctx.accounts.price_feed)
-            .map_err(|_| error!(ErrorCode::InvalidOracleAccount))?;
+            .map_err(|_| BetError::InvalidOracleOwner)?;
 
-        let current_price = price_feed
-            .get_price_no_older_than(clock.unix_timestamp, STALENESS_THRESHOLD_SECONDS)
-            .ok_or_else(|| error!(ErrorCode::PriceStale))?;
+        let price_data = price_feed
+            .get_price_no_older_than(clock.slot as i64, 120)
+            .ok_or(BetError::PriceStale)?;
 
-        // Note: Pyth's Price.price is an i64; we compare against the stored u64 `bet.rate`.
-        // The `rate` must be provided in the same raw price units as Pyth's Price.price.
-        let pyth_price_i128 = current_price.price as i128;
-        let bet_rate_i128 = bet.rate as i128;
-
+        // Compare price to rate
         require!(
-            pyth_price_i128 >= bet_rate_i128,
-            ErrorCode::PriceConditionNotMet
+            price_data.price >= bet.rate as i64,
+            BetError::BetNotWon
         );
 
-        // If we reach here, the player wins. The account attribute `close = player` on bet_info
-        // will cause Anchor runtime to transfer all lamports from the PDA to `player` and deallocate the PDA.
-        msg!("Win: player {} won bet {}. pyth_price = {} expo = {}", 
-             ctx.accounts.player.key(), ctx.accounts.bet_info.key(), current_price.price, current_price.expo);
+        // Transfer lamports to player and close PDA
+        let player_account = &mut ctx.accounts.player.to_account_info();
+        let bet_account = &mut ctx.accounts.bet_info.to_account_info();
+
+        **player_account.try_borrow_mut_lamports()? += **bet_account.lamports.borrow();
+        **bet_account.try_borrow_mut_lamports()? = 0;
+
         Ok(())
     }
 
-    /// timeout: called by owner (signer) after deadline to reclaim pot if player didn't win
-    /// * Anchor `close = owner` will send all lamports to owner and deallocate the PDA.
-    #[access_control(owner_is_signer(&ctx.accounts.owner))]
+    /// Owner reclaims pot after deadline if no win occurred.
     pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
+        let clock = Clock::get()?;
         let bet = &ctx.accounts.bet_info;
 
-        // only the owner who created the bet can call timeout
-        require!(ctx.accounts.owner.key() == bet.owner, ErrorCode::NotOwner);
+        // Only allow timeout after deadline
+        require!(
+            (clock.unix_timestamp as u64) >= bet.deadline,
+            BetError::DeadlineNotPassed
+        );
 
-        let clock = Clock::get()?;
-        let now = clock.unix_timestamp as u64;
-        require!(now >= bet.deadline, ErrorCode::BetNotExpired);
+        // Only owner can timeout
+        require!(
+            bet.owner == *ctx.accounts.owner.key,
+            BetError::UnauthorizedOwner
+        );
 
-        msg!("Timeout: owner {} reclaimed bet {} after deadline {}", 
-             ctx.accounts.owner.key(), ctx.accounts.bet_info.key(), bet.deadline);
-        // Anchor will close the account and send lamports to owner (since `close = owner` on account).
+        // No need for manual transfer: `close = owner` handles lamports refund and account closure
         Ok(())
     }
 }
 
-// ---------------------------- Contexts ----------------------------
+// ------------------------- Accounts -------------------------
 
 #[derive(Accounts)]
-#[instruction(delay: u64, wager: u64, rate: u64)]
 pub struct InitCtx<'info> {
-    /// Owner must be signer
     #[account(mut)]
-    pub owner: Signer<'info>,
+    pub owner: Signer<'info>,   // signer creating the bet
 
-    /// PDA created using seeds = [owner.key().as_ref()]
     #[account(
         init,
         payer = owner,
-        space = OracleBetInfo::LEN,
+        space = 8 + OracleBetInfo::LEN,
         seeds = [owner.key().as_ref()],
         bump
     )]
@@ -185,16 +159,17 @@ pub struct InitCtx<'info> {
 
 #[derive(Accounts)]
 pub struct JoinCtx<'info> {
-    /// Player must sign
     #[account(mut)]
-    pub player: Signer<'info>,
+    pub player: Signer<'info>,   // signer joining the bet
 
-    /// Owner is only a reference here (not a signer)
-    /// CHECK: validated by PDA seeds on bet_info
-    pub owner: UncheckedAccount<'info>,
+    /// CHECK: Only used as PDA seed for bet_info. Not read or written.
+    pub owner: AccountInfo<'info>,
 
-    /// PDA must match `seeds = [owner.key().as_ref()]`
-    #[account(mut, seeds = [owner.key().as_ref()], bump)]
+    #[account(
+        mut,
+        seeds = [owner.key().as_ref()],
+        bump = bet_info.bump,
+    )]
     pub bet_info: Account<'info, OracleBetInfo>,
 
     pub system_program: Program<'info, System>,
@@ -202,25 +177,20 @@ pub struct JoinCtx<'info> {
 
 #[derive(Accounts)]
 pub struct WinCtx<'info> {
-    /// Player signs
-    #[account(mut)]
-    pub player: Signer<'info>,
+    /// CHECK: player must match the stored player in bet_info
+    pub player: AccountInfo<'info>, // <-- was Signer<'info'], now AccountInfo
 
-    /// Owner reference (for PDA seeds)
-    /// CHECK: used as seed only
-    pub owner: UncheckedAccount<'info>,
+    /// CHECK: only used as PDA seed for bet_info
+    pub owner: AccountInfo<'info>,
 
-    /// PDA; when the player wins we close this account and send lamports to the player
     #[account(
         mut,
         seeds = [owner.key().as_ref()],
-        bump,
-        close = player
+        bump = bet_info.bump,
     )]
     pub bet_info: Account<'info, OracleBetInfo>,
 
-    /// Pyth price feed account (raw AccountInfo)
-    /// CHECK: validated at runtime (owner + parsing)
+    /// CHECK: Pyth price feed account
     pub price_feed: AccountInfo<'info>,
 
     pub system_program: Program<'info, System>,
@@ -228,23 +198,22 @@ pub struct WinCtx<'info> {
 
 #[derive(Accounts)]
 pub struct TimeoutCtx<'info> {
-    /// Owner must sign
     #[account(mut)]
-    pub owner: Signer<'info>,
+    pub owner: Signer<'info>, // signer reclaiming pot
 
-    /// PDA; owner reclaims pot, account is closed and lamports returned to owner
     #[account(
         mut,
         seeds = [owner.key().as_ref()],
-        bump,
-        close = owner
+        bump = bet_info.bump,
+        close = owner  // ✅ automatically refunds lamports to owner
     )]
     pub bet_info: Account<'info, OracleBetInfo>,
 
     pub system_program: Program<'info, System>,
 }
 
-// ---------------------------- Account data ----------------------------
+
+// ------------------------- State -------------------------
 
 #[account]
 pub struct OracleBetInfo {
@@ -253,49 +222,31 @@ pub struct OracleBetInfo {
     pub wager: u64,
     pub deadline: u64,
     pub rate: u64,
+    pub bump: u8,
 }
 
 impl OracleBetInfo {
-    // space calculation: 8 discriminator + sizes of fields
-    // Pubkey (32) + Pubkey (32) + u64 (8) + u64 (8) + u64 (8) = 88, plus 8 = 96
-    pub const LEN: usize = 8 + 32 + 32 + 8 + 8 + 8;
+    pub const LEN: usize = 32 + 32 + 8 + 8 + 8 + 1;
 }
 
-// ---------------------------- Errors & Guards ----------------------------
-
-fn owner_is_signer(owner: &Signer) -> Result<()> {
-    // the anchor account type already ensures signer, this is for explicit access control macro usage
-    Ok(())
-}
-
-fn player_is_signer(player: &Signer) -> Result<()> {
-    Ok(())
-}
+// ------------------------- Errors -------------------------
 
 #[error_code]
-pub enum ErrorCode {
-    #[msg("Arithmetic overflow when computing deadline")]
-    ArithmeticOverflow,
-    #[msg("A player has already joined this bet")]
-    AlreadyHasPlayer,
-    #[msg("The player cannot be the owner")]
-    PlayerIsOwner,
-    #[msg("The bet has already expired")]
-    BetAlreadyExpired,
-    #[msg("Only the recorded player can call this")]
-    NotPlayer,
-    #[msg("Only the owner can call this")]
-    NotOwner,
-    #[msg("Bet not expired yet")]
-    BetNotExpired,
-    #[msg("Oracle account is invalid or not a Pyth price account")]
-    InvalidOracleAccount,
-    #[msg("Price data is stale")]
+pub enum BetError {
+    #[msg("Player already joined")]
+    AlreadyJoined,
+    #[msg("Deadline passed")]
+    DeadlinePassed,
+    #[msg("Deadline not yet passed")]
+    DeadlineNotPassed,
+    #[msg("Unauthorized player")]
+    UnauthorizedPlayer,
+    #[msg("Unauthorized owner")]
+    UnauthorizedOwner,
+    #[msg("Oracle price is stale")]
     PriceStale,
-    #[msg("Price condition not met")]
-    PriceConditionNotMet,
-    #[msg("Attempt to transfer more lamports than available or arithmetic overflow")]
-    InsufficientFundsOrOverflow,
-    #[msg("Generic arithmetic overflow")]
-    ArithmeticOverflowGeneric,
+    #[msg("Oracle feed owner is invalid")]
+    InvalidOracleOwner,     // ✅ <-- add this
+    #[msg("Player did not win")]
+    BetNotWon,
 }

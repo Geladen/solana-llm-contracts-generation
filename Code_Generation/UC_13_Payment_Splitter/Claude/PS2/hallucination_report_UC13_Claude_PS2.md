@@ -1,14 +1,20 @@
 ## Identified Hallucinations
 
-### Context Deviation: Inconsistency
+### Context Deviation: Dead Code
 **Description:** 
 
-payment calculation logic double-counts funds, making all releasable amounts zero.
+The Anchor program creates signer_seeds variables but never utilizes it for PDA signing in subsequent operations.
 
 **Code Example:**
 ```rust
-let total_released = ps_info.released_amounts.iter().sum::<u64>();
-let total_received = distributable_funds + total_released;
+        // Prepare seeds for PDA signing
+        let initializer_key = ctx.accounts.initializer.key();
+        let seeds = &[
+            b"payment_splitter".as_ref(),
+            initializer_key.as_ref(),
+            &[ctx.bumps.ps_info],
+        ];
+        let signer_seeds = &[&seeds[..]];
 ```
 
-**CrystalBLEU similarity: 0.178** 
+**CrystalBLEU similarity: 0.213** 

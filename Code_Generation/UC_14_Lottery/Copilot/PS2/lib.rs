@@ -1,17 +1,10 @@
 use anchor_lang::prelude::*;
-use borsh::{BorshDeserialize, BorshSerialize};
-use anchor_lang::solana_program::keccak::hash as keccak_hash;
+use anchor_lang::solana_program::{keccak, sysvar::clock::Clock};
+use anchor_lang::system_program::{Transfer, transfer};
 
-declare_id!("21XS8WfVLHccBDZje8V4jE9y4J3n2T42ja7a5Map2ZK8");
+declare_id!("2pngBWtERx4ShLzqhcGLMB7sPwYq7co8iKG9URmBWYka");
 
-/// Configuration constants
-const SECRET_MAX_LEN: usize = 64;
-const LOTTERY_INFO_DISCRIMINATOR: usize = 8;
-const PUBKEY_BYTES: usize = 32;
-const HASHLOCK_BYTES: usize = 32;
-const U64_BYTES: usize = 8;
-const STRING_PREFIX: usize = 4;
-const EXTENSION_SECONDS: u64 = 300;
+pub const REVEAL_EXTENSION: u64 = 60; // seconds
 
 #[program]
 pub mod lottery {
@@ -24,52 +17,44 @@ pub mod lottery {
         delay: u64,
         amount: u64,
     ) -> Result<()> {
-        require!(hashlock1 != hashlock2, LotteryError::IdenticalHashlocksNotAllowed);
+        require!(hashlock1 != hashlock2, LotteryError::IdenticalHashlocks);
 
         let clock = Clock::get()?;
-        let current_ts = clock.unix_timestamp as u64;
-        let end_reveal = current_ts.checked_add(delay).ok_or(LotteryError::DeadlineOverflow)?;
-        require!(end_reveal > current_ts, LotteryError::EndRevealInPast);
+        let now = clock.unix_timestamp as u64;
+        let end_reveal = now
+            .checked_add(delay)
+            .ok_or(LotteryError::TimestampOverflow)?;
+        require!(end_reveal > now, LotteryError::EndRevealInPast);
 
-        // Transfer 'amount' lamports from both player1 and player2 into the lottery PDA using CPI
-        let ix1 = anchor_lang::solana_program::system_instruction::transfer(
-            ctx.accounts.player1.to_account_info().key,
-            ctx.accounts.lottery_info.to_account_info().key,
-            amount,
-        );
-        anchor_lang::solana_program::program::invoke(
-            &ix1,
-            &[
-                ctx.accounts.player1.to_account_info(),
-                ctx.accounts.lottery_info.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
-
-        let ix2 = anchor_lang::solana_program::system_instruction::transfer(
-            ctx.accounts.player2.to_account_info().key,
-            ctx.accounts.lottery_info.to_account_info().key,
-            amount,
-        );
-        anchor_lang::solana_program::program::invoke(
-            &ix2,
-            &[
-                ctx.accounts.player2.to_account_info(),
-                ctx.accounts.lottery_info.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
-
-        // Initialize LotteryInfo fields
         let lottery = &mut ctx.accounts.lottery_info;
         lottery.state = LotteryState::Init;
-        lottery.player1 = *ctx.accounts.player1.to_account_info().key;
-        lottery.player2 = *ctx.accounts.player2.to_account_info().key;
+        lottery.player1 = ctx.accounts.player1.key();
+        lottery.player2 = ctx.accounts.player2.key();
         lottery.hashlock1 = hashlock1;
         lottery.hashlock2 = hashlock2;
         lottery.secret1 = String::new();
         lottery.secret2 = String::new();
         lottery.end_reveal = end_reveal;
+
+        // Transfer 'amount' lamports from player1 to PDA
+        {
+            let cpi_accounts = Transfer {
+                from: ctx.accounts.player1.to_account_info(),
+                to: ctx.accounts.lottery_info.to_account_info(),
+            };
+            let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
+            transfer(cpi_ctx, amount)?;
+        }
+
+        // Transfer 'amount' lamports from player2 to PDA
+        {
+            let cpi_accounts = Transfer {
+                from: ctx.accounts.player2.to_account_info(),
+                to: ctx.accounts.lottery_info.to_account_info(),
+            };
+            let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
+            transfer(cpi_ctx, amount)?;
+        }
 
         Ok(())
     }
@@ -77,14 +62,14 @@ pub mod lottery {
     pub fn reveal_p1(ctx: Context<RevealP1Ctx>, secret: String) -> Result<()> {
         let clock = Clock::get()?;
         let now = clock.unix_timestamp as u64;
-        require!(now <= ctx.accounts.lottery_info.end_reveal, LotteryError::RevealPeriodOver);
-
-        require!(secret.as_bytes().len() <= SECRET_MAX_LEN, LotteryError::SecretTooLong);
-
-        let hash = keccak_hash(secret.as_bytes()).0;
-        require!(hash == ctx.accounts.lottery_info.hashlock1, LotteryError::InvalidSecret);
-
         let lottery = &mut ctx.accounts.lottery_info;
+
+        require!(now <= lottery.end_reveal, LotteryError::RevealDeadlinePassed);
+        require!(ctx.accounts.player1.key() == lottery.player1, LotteryError::InvalidPlayer);
+
+        let hashed = keccak::hash(secret.as_bytes()).0;
+        require!(hashed == lottery.hashlock1, LotteryError::HashMismatch);
+
         lottery.secret1 = secret;
         lottery.state = LotteryState::RevealP1;
 
@@ -94,57 +79,55 @@ pub mod lottery {
     pub fn reveal_p2(ctx: Context<RevealP2Ctx>, secret: String) -> Result<()> {
         let clock = Clock::get()?;
         let now = clock.unix_timestamp as u64;
+        let lottery = &mut ctx.accounts.lottery_info;
 
-        require!(
-            ctx.accounts.lottery_info.state == LotteryState::RevealP1,
-            LotteryError::InvalidStateForRevealP2
-        );
+        let cutoff = lottery
+            .end_reveal
+            .checked_add(REVEAL_EXTENSION)
+            .ok_or(LotteryError::TimestampOverflow)?;
+        require!(now <= cutoff, LotteryError::RevealDeadlinePassed);
+        require!(ctx.accounts.player2.key() == lottery.player2, LotteryError::InvalidPlayer);
 
-        require!(
-            now <= ctx.accounts.lottery_info.end_reveal.checked_add(EXTENSION_SECONDS).ok_or(LotteryError::DeadlineOverflow)?,
-            LotteryError::RevealPeriodOver
-        );
+        let hashed = keccak::hash(secret.as_bytes()).0;
+        require!(hashed == lottery.hashlock2, LotteryError::HashMismatch);
 
-        require!(secret.as_bytes().len() <= SECRET_MAX_LEN, LotteryError::SecretTooLong);
-
-        let hash = keccak_hash(secret.as_bytes()).0;
-        require!(hash == ctx.accounts.lottery_info.hashlock2, LotteryError::InvalidSecret);
+        // Ensure player1 already revealed
+        require!(!lottery.secret1.is_empty(), LotteryError::P1NotRevealed);
 
         // Store secret2 and update state
-        let lottery = &mut ctx.accounts.lottery_info;
-        lottery.secret2 = secret;
+        lottery.secret2 = secret.clone();
         lottery.state = LotteryState::RevealP2;
 
-        // Determine winner: (secret1.len() + secret2.len()) % 2
-        let s1_len = lottery.secret1.as_bytes().len() as u64;
-        let s2_len = lottery.secret2.as_bytes().len() as u64;
-        let choice = (s1_len + s2_len) % 2;
+        // Determine winner
+        let s1_len = lottery.secret1.len();
+        let s2_len = secret.len();
+        let parity = (s1_len + s2_len) % 2;
 
-        let winner_pubkey = if choice == 0 {
-            lottery.player1
-        } else {
-            lottery.player2
-        };
-
-        // Transfer entire pot to winner via direct lamports manipulation
+        // Transfer whole pot to winner using safe scoped borrows
         let lottery_ai = ctx.accounts.lottery_info.to_account_info();
-        let winner_ai = if winner_pubkey == *ctx.accounts.player1.to_account_info().key {
-            ctx.accounts.player1.to_account_info()
+        let player1_ai = ctx.accounts.player1.to_account_info();
+        let player2_ai = ctx.accounts.player2.to_account_info();
+
+        // take pot and zero PDA in one scoped borrow
+        let pot: u64;
+        {
+            let mut lotto_lamports_ref = lottery_ai.try_borrow_mut_lamports()?;
+            pot = **lotto_lamports_ref;
+            require!(pot > 0, LotteryError::EmptyPot);
+            **lotto_lamports_ref = 0u64;
+        } // lotto_lamports_ref dropped here
+
+        if parity == 0 {
+            let mut dest_ref = player1_ai.try_borrow_mut_lamports()?;
+            let curr = **dest_ref;
+            let new = curr.checked_add(pot).ok_or(LotteryError::LamportOverflow)?;
+            **dest_ref = new;
         } else {
-            ctx.accounts.player2.to_account_info()
-        };
-
-        // Safely move lamports
-        let mut lottery_lamports = lottery_ai.try_borrow_mut_lamports()?;
-        let amount = **lottery_lamports;
-        require!(amount > 0, LotteryError::NoFundsInPot);
-        **lottery_lamports = 0u64;
-
-        let mut winner_lamports = winner_ai.try_borrow_mut_lamports()?;
-        let winner_current = **winner_lamports;
-        **winner_lamports = winner_current
-            .checked_add(amount)
-            .ok_or(LotteryError::LamportArithmeticOverflow)?;
+            let mut dest_ref = player2_ai.try_borrow_mut_lamports()?;
+            let curr = **dest_ref;
+            let new = curr.checked_add(pot).ok_or(LotteryError::LamportOverflow)?;
+            **dest_ref = new;
+        }
 
         Ok(())
     }
@@ -152,24 +135,27 @@ pub mod lottery {
     pub fn redeem_if_p1_no_reveal(ctx: Context<RedeemIfP1NoRevealCtx>) -> Result<()> {
         let clock = Clock::get()?;
         let now = clock.unix_timestamp as u64;
-        require!(now >= ctx.accounts.lottery_info.end_reveal, LotteryError::RevealPeriodNotOver);
+        let lottery = &mut ctx.accounts.lottery_info;
 
-        // Ensure player1 didn't reveal
-        require!(ctx.accounts.lottery_info.secret1.is_empty(), LotteryError::Player1AlreadyRevealed);
+        require!(now > lottery.end_reveal, LotteryError::RevealDeadlineNotPassed);
+        require!(lottery.secret1.is_empty(), LotteryError::P1AlreadyRevealed);
+        require!(ctx.accounts.player2.key() == lottery.player2, LotteryError::InvalidPlayer);
 
         let lottery_ai = ctx.accounts.lottery_info.to_account_info();
         let player2_ai = ctx.accounts.player2.to_account_info();
 
-        let mut lottery_lamports = lottery_ai.try_borrow_mut_lamports()?;
-        let amount = **lottery_lamports;
-        require!(amount > 0, LotteryError::NoFundsInPot);
-        **lottery_lamports = 0u64;
+        let pot: u64;
+        {
+            let mut lotto_lamports_ref = lottery_ai.try_borrow_mut_lamports()?;
+            pot = **lotto_lamports_ref;
+            require!(pot > 0, LotteryError::EmptyPot);
+            **lotto_lamports_ref = 0u64;
+        }
 
-        let mut player2_lamports = player2_ai.try_borrow_mut_lamports()?;
-        let player2_current = **player2_lamports;
-        **player2_lamports = player2_current
-            .checked_add(amount)
-            .ok_or(LotteryError::LamportArithmeticOverflow)?;
+        let mut dest_ref = player2_ai.try_borrow_mut_lamports()?;
+        let curr = **dest_ref;
+        let new = curr.checked_add(pot).ok_or(LotteryError::LamportOverflow)?;
+        **dest_ref = new;
 
         Ok(())
     }
@@ -177,127 +163,43 @@ pub mod lottery {
     pub fn redeem_if_p2_no_reveal(ctx: Context<RedeemIfP2NoRevealCtx>) -> Result<()> {
         let clock = Clock::get()?;
         let now = clock.unix_timestamp as u64;
+        let lottery = &mut ctx.accounts.lottery_info;
 
-        require!(
-            now >= ctx.accounts.lottery_info.end_reveal.checked_add(EXTENSION_SECONDS).ok_or(LotteryError::DeadlineOverflow)?,
-            LotteryError::RevealPeriodNotOver
-        );
-
-        // Ensure player2 didn't reveal
-        require!(ctx.accounts.lottery_info.secret2.is_empty(), LotteryError::Player2AlreadyRevealed);
+        let cutoff = lottery
+            .end_reveal
+            .checked_add(REVEAL_EXTENSION)
+            .ok_or(LotteryError::TimestampOverflow)?;
+        require!(now > cutoff, LotteryError::RevealDeadlineNotPassed);
+        require!(lottery.secret2.is_empty(), LotteryError::P2AlreadyRevealed);
+        require!(ctx.accounts.player1.key() == lottery.player1, LotteryError::InvalidPlayer);
 
         let lottery_ai = ctx.accounts.lottery_info.to_account_info();
         let player1_ai = ctx.accounts.player1.to_account_info();
 
-        let mut lottery_lamports = lottery_ai.try_borrow_mut_lamports()?;
-        let amount = **lottery_lamports;
-        require!(amount > 0, LotteryError::NoFundsInPot);
-        **lottery_lamports = 0u64;
+        let pot: u64;
+        {
+            let mut lotto_lamports_ref = lottery_ai.try_borrow_mut_lamports()?;
+            pot = **lotto_lamports_ref;
+            require!(pot > 0, LotteryError::EmptyPot);
+            **lotto_lamports_ref = 0u64;
+        }
 
-        let mut player1_lamports = player1_ai.try_borrow_mut_lamports()?;
-        let player1_current = **player1_lamports;
-        **player1_lamports = player1_current
-            .checked_add(amount)
-            .ok_or(LotteryError::LamportArithmeticOverflow)?;
+        let mut dest_ref = player1_ai.try_borrow_mut_lamports()?;
+        let curr = **dest_ref;
+        let new = curr.checked_add(pot).ok_or(LotteryError::LamportOverflow)?;
+        **dest_ref = new;
 
         Ok(())
     }
 }
 
-#[derive(Accounts)]
-#[instruction(hashlock1: [u8;32], hashlock2: [u8;32], delay: u64, amount: u64)]
-pub struct JoinCtx<'info> {
-    /// Player1 must sign and pays for account creation
-    #[account(mut)]
-    pub player1: Signer<'info>,
-
-    /// Player2 must sign
-    #[account(mut)]
-    pub player2: Signer<'info>,
-
-    #[account(
-        init,
-        seeds = [player1.key().as_ref(), player2.key().as_ref()],
-        bump,
-        payer = player1,
-        space = LOTTERY_INFO_DISCRIMINATOR + LotteryInfo::MAX_SIZE
-    )]
-    pub lottery_info: Account<'info, LotteryInfo>,
-
-    pub system_program: Program<'info, System>,
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum LotteryState {
+    Init = 0,
+    RevealP1 = 1,
+    RevealP2 = 2,
 }
 
-#[derive(Accounts)]
-pub struct RevealP1Ctx<'info> {
-    #[account(mut)]
-    pub player1: Signer<'info>,
-
-    /// CHECK: player2 is used only for PDA seed verification; mark mut if you plan to transfer to it
-    pub player2: UncheckedAccount<'info>,
-
-    #[account(
-        mut,
-        seeds = [player1.key().as_ref(), player2.key().as_ref()],
-        bump,
-        has_one = player1,
-        has_one = player2,
-    )]
-    pub lottery_info: Account<'info, LotteryInfo>,
-}
-
-#[derive(Accounts)]
-pub struct RevealP2Ctx<'info> {
-    /// CHECK: player1 used only for PDA seed verification, but lamports may be credited so mark mut
-    #[account(mut)]
-    pub player1: UncheckedAccount<'info>,
-
-    #[account(mut)]
-    pub player2: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [player1.key().as_ref(), player2.key().as_ref()],
-        bump,
-        has_one = player1,
-        has_one = player2,
-    )]
-    pub lottery_info: Account<'info, LotteryInfo>,
-}
-
-#[derive(Accounts)]
-pub struct RedeemIfP1NoRevealCtx<'info> {
-    /// CHECK: player1 used only for PDA seed verification, lamports not changed here but keep as reference
-    pub player1: UncheckedAccount<'info>,
-
-    #[account(mut)]
-    pub player2: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [player1.key().as_ref(), player2.key().as_ref()],
-        bump,
-        has_one = player1,
-        has_one = player2,
-    )]
-    pub lottery_info: Account<'info, LotteryInfo>,
-}
-#[derive(Accounts)]
-pub struct RedeemIfP2NoRevealCtx<'info> {
-    #[account(mut)]
-    pub player1: Signer<'info>,
-
-    /// CHECK: player2 used only for PDA seed verification, may be read-only if not credited
-    pub player2: UncheckedAccount<'info>,
-
-    #[account(
-        mut,
-        seeds = [player1.key().as_ref(), player2.key().as_ref()],
-        bump,
-        has_one = player1,
-        has_one = player2,
-    )]
-    pub lottery_info: Account<'info, LotteryInfo>,
-}
 #[account]
 pub struct LotteryInfo {
     pub state: LotteryState,
@@ -310,50 +212,121 @@ pub struct LotteryInfo {
     pub end_reveal: u64,
 }
 
-impl LotteryInfo {
-    pub const MAX_SIZE: usize = 1 // state as u8
-        + PUBKEY_BYTES
-        + PUBKEY_BYTES
-        + HASHLOCK_BYTES
-        + (STRING_PREFIX + SECRET_MAX_LEN)
-        + HASHLOCK_BYTES
-        + (STRING_PREFIX + SECRET_MAX_LEN)
-        + U64_BYTES;
+#[derive(Accounts)]
+#[instruction(hashlock1: [u8;32], hashlock2: [u8;32], delay: u64, amount: u64)]
+pub struct JoinCtx<'info> {
+    /// CHECK: player1 is the payer and signer for init; validated as signer by Anchor
+    #[account(mut, signer)]
+    pub player1: AccountInfo<'info>,
+
+    /// CHECK: player2 must sign the join; validated as signer by Anchor
+    #[account(mut, signer)]
+    pub player2: AccountInfo<'info>,
+
+    /// PDA initialized and owned by this program via seeds [player1, player2]
+    #[account(
+        init,
+        payer = player1,
+        space = LotteryInfo::space(),
+        seeds = [player1.key().as_ref(), player2.key().as_ref()],
+        bump
+    )]
+    pub lottery_info: Account<'info, LotteryInfo>,
+
+    pub system_program: Program<'info, System>,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Debug)]
-pub enum LotteryState {
-    Init = 0,
-    RevealP1 = 1,
-    RevealP2 = 2,
+#[derive(Accounts)]
+pub struct RevealP1Ctx<'info> {
+    /// CHECK: player1 signer; Anchor enforces signer
+    #[account(signer)]
+    pub player1: AccountInfo<'info>,
+
+    /// CHECK: player2 is readonly reference used for seed derivation only
+    pub player2: AccountInfo<'info>,
+
+    /// PDA derived from [player1, player2]; owned and validated by Anchor via seeds
+    #[account(mut, seeds = [player1.key().as_ref(), player2.key().as_ref()], bump)]
+    pub lottery_info: Account<'info, LotteryInfo>,
+}
+
+#[derive(Accounts)]
+pub struct RevealP2Ctx<'info> {
+    /// CHECK: player1 is a reference and may receive lamports; must be mutable
+    #[account(mut)]
+    pub player1: AccountInfo<'info>,
+
+    /// CHECK: player2 signer and may receive lamports; must be mutable
+    #[account(mut, signer)]
+    pub player2: AccountInfo<'info>,
+
+    /// PDA derived from [player1, player2]; owned and validated by Anchor via seeds
+    #[account(mut, seeds = [player1.key().as_ref(), player2.key().as_ref()], bump)]
+    pub lottery_info: Account<'info, LotteryInfo>,
+}
+
+#[derive(Accounts)]
+pub struct RedeemIfP1NoRevealCtx<'info> {
+    /// CHECK: player1 is readonly; used for seed derivation and validation
+    pub player1: AccountInfo<'info>,
+
+    /// CHECK: player2 signer and recipient for redeem; Anchor enforces signer
+    #[account(mut, signer)]
+    pub player2: AccountInfo<'info>,
+
+    /// PDA derived from [player1, player2]; owned and validated by Anchor via seeds
+    #[account(mut, seeds = [player1.key().as_ref(), player2.key().as_ref()], bump)]
+    pub lottery_info: Account<'info, LotteryInfo>,
+}
+
+#[derive(Accounts)]
+pub struct RedeemIfP2NoRevealCtx<'info> {
+    /// CHECK: player1 signer and recipient for redeem; Anchor enforces signer
+    #[account(mut, signer)]
+    pub player1: AccountInfo<'info>,
+
+    /// CHECK: player2 is readonly; used for seed derivation and validation
+    pub player2: AccountInfo<'info>,
+
+    /// PDA derived from [player1, player2]; owned and validated by Anchor via seeds
+    #[account(mut, seeds = [player1.key().as_ref(), player2.key().as_ref()], bump)]
+    pub lottery_info: Account<'info, LotteryInfo>,
+}
+
+
+impl LotteryInfo {
+    pub fn space() -> usize {
+        const MAX_SECRET_LEN: usize = 128;
+        8 + 1 + 32 + 32 + 32 + 4 + MAX_SECRET_LEN + 32 + 4 + MAX_SECRET_LEN + 8
+    }
 }
 
 #[error_code]
 pub enum LotteryError {
-    #[msg("Players provided identical hash commitments which is not allowed")]
-    IdenticalHashlocksNotAllowed,
-    #[msg("End reveal would be in the past")]
+    #[msg("Hashlocks must be different")]
+    IdenticalHashlocks,
+    #[msg("End reveal in the past or overflow")]
     EndRevealInPast,
-    #[msg("Deadline arithmetic overflow")]
-    DeadlineOverflow,
-    #[msg("Reveal period is over")]
-    RevealPeriodOver,
-    #[msg("Secret provided does not match the hashlock")]
-    InvalidSecret,
-    #[msg("Secret exceeds maximum allowed length")]
-    SecretTooLong,
-    #[msg("Invalid state for RevealP2; player1 must reveal first")]
-    InvalidStateForRevealP2,
-    #[msg("No funds in the pot to transfer")]
-    NoFundsInPot,
-    #[msg("Lamport arithmetic underflow")]
-    LamportArithmeticUnderflow,
-    #[msg("Lamport arithmetic overflow")]
-    LamportArithmeticOverflow,
-    #[msg("Reveal period not over yet")]
-    RevealPeriodNotOver,
+    #[msg("Timestamp arithmetic overflow")]
+    TimestampOverflow,
+    #[msg("Reveal deadline has passed")]
+    RevealDeadlinePassed,
+    #[msg("Invalid player for this action")]
+    InvalidPlayer,
+    #[msg("Hash mismatch for provided secret")]
+    HashMismatch,
+    #[msg("Player1 did not reveal")]
+    P1NotRevealed,
     #[msg("Player1 already revealed")]
-    Player1AlreadyRevealed,
+    P1AlreadyRevealed,
+    #[msg("Player2 did not reveal")]
+    P2NotRevealed,
     #[msg("Player2 already revealed")]
-    Player2AlreadyRevealed,
+    P2AlreadyRevealed,
+    #[msg("Pot is empty")]
+    EmptyPot,
+    #[msg("Lamport arithmetic overflow")]
+    LamportOverflow,
+    #[msg("Reveal deadline not yet passed")]
+    RevealDeadlineNotPassed,
 }

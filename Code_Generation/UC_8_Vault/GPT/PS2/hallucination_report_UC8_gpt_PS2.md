@@ -1,17 +1,22 @@
 ## Identified Hallucinations
 
-### Knowledge Conflicting: API Knowledge
+### Context Devition: Dead Code
 **Description:** 
 
-The code imports BorshSerialize but never actually utilizes it in the implementation.
+The program defines unix_timestamp_now function that is never called.
 
 **Code Example:**
 ```rust
-use borsh::{BorshDeserialize, BorshSerialize};
+/// Helper to get current unix timestamp as u64 with safety checks.
+fn unix_timestamp_now() -> Result<u64> {
+    let ts_i64 = Clock::get()?.unix_timestamp;
+    if ts_i64 < 0 {
+        return err!(VaultError::InvalidClockTime);
+    }
+    Ok(ts_i64 as u64)
+}
 ```
 
-**CrystalBLEU similarity: 0.174** 
-
-
+**CrystalBLEU similarity: 0.165** 
 
 

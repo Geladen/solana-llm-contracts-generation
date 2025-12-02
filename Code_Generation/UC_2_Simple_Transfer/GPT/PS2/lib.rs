@@ -1,113 +1,102 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 
-declare_id!("Cj2EdyUpSUm6uaBu3NokV8oqSKNgpf8Qa2vD1cDWgQxc");
+
+declare_id!("7J5WJsJq21xoMvzpCjQxS3PLgk5ie4kz47qxUmE84BV");
 
 #[program]
 pub mod simple_transfer {
     use super::*;
 
     pub fn deposit(ctx: Context<DepositCtx>, amount_to_deposit: u64) -> Result<()> {
-        // Reject zero deposits
-        require!(amount_to_deposit > 0, ErrorCode::ZeroDeposit);
+        require!(amount_to_deposit > 0, ErrorCode::ZeroAmount);
 
         let sender_key = ctx.accounts.sender.key();
         let recipient_key = ctx.accounts.recipient.key();
 
-        // Separate PDA borrow to avoid reborrow conflicts
-        {
-            let pda = &mut ctx.accounts.balance_holder_pda;
+        // Compute PDA seeds
+        let bump = ctx.bumps.balance_holder_pda;
+        let seeds: &[&[u8]] = &[
+            recipient_key.as_ref(),
+            sender_key.as_ref(),
+            &[bump],
+        ];
 
-            // Initialize if new
-            if pda.sender == Pubkey::default() && pda.recipient == Pubkey::default() {
-                pda.sender = sender_key;
-                pda.recipient = recipient_key;
-                pda.amount = 0;
-            } else {
-                require_keys_eq!(pda.sender, sender_key, ErrorCode::SenderMismatch);
-                require_keys_eq!(pda.recipient, recipient_key, ErrorCode::RecipientMismatch);
-            }
-        }
+        let pda_info = ctx.accounts.balance_holder_pda.to_account_info();
+        let pda_account = &mut ctx.accounts.balance_holder_pda;
 
-        // Clone the PDA's AccountInfo for the CPI (avoids borrow conflict)
-        let pda_ai = ctx.accounts.balance_holder_pda.to_account_info();
-        let cpi_accounts = system_program::Transfer {
-            from: ctx.accounts.sender.to_account_info(),
-            to: pda_ai,
-        };
-        let cpi_program = ctx.accounts.system_program.to_account_info();
-        system_program::transfer(CpiContext::new(cpi_program, cpi_accounts), amount_to_deposit)?;
+        // Transfer lamports from sender to PDA
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::Transfer {
+                from: ctx.accounts.sender.to_account_info(),
+                to: pda_info.clone(),
+            },
+        );
+        system_program::transfer(cpi_ctx, amount_to_deposit)?;
 
-        // Update PDA amount after CPI
-        let pda = &mut ctx.accounts.balance_holder_pda;
-        pda.amount = pda
+        // Update PDA state
+        pda_account.sender = sender_key;
+        pda_account.recipient = recipient_key;
+        pda_account.amount = pda_account
             .amount
             .checked_add(amount_to_deposit)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
+            .ok_or(ErrorCode::Overflow)?;
 
         Ok(())
     }
 
     pub fn withdraw(ctx: Context<WithdrawCtx>, amount_to_withdraw: u64) -> Result<()> {
-        require!(amount_to_withdraw > 0, ErrorCode::ZeroWithdrawal);
+        require!(amount_to_withdraw > 0, ErrorCode::ZeroAmount);
 
         let sender_key = ctx.accounts.sender.key();
         let recipient_key = ctx.accounts.recipient.key();
 
-        // Clone PDA AccountInfo early (before mutable borrow)
+        let bump = ctx.bumps.balance_holder_pda;
+        let seeds: &[&[&[u8]]] = &[&[
+            recipient_key.as_ref(),
+            sender_key.as_ref(),
+            &[bump],
+        ]];
+
         let pda_info = ctx.accounts.balance_holder_pda.to_account_info();
-        let sender_info = ctx.accounts.sender.to_account_info();
-        let recipient_info = ctx.accounts.recipient.to_account_info();
+        let pda_account = &mut ctx.accounts.balance_holder_pda;
 
-        // Now safely mutably borrow PDA data
-        let pda = &mut ctx.accounts.balance_holder_pda;
+        require!(
+            amount_to_withdraw <= pda_account.amount,
+            ErrorCode::Underflow
+        );
 
-        require_keys_eq!(pda.sender, sender_key, ErrorCode::SenderMismatch);
-        require_keys_eq!(pda.recipient, recipient_key, ErrorCode::RecipientMismatch);
-        require!(pda.amount >= amount_to_withdraw, ErrorCode::InsufficientRecordedFunds);
+        // Transfer lamports from PDA to recipient using signer seeds
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::Transfer {
+                from: pda_info.clone(),
+                to: ctx.accounts.recipient.to_account_info(),
+            },
+            seeds,
+        );
+        system_program::transfer(cpi_ctx, amount_to_withdraw)?;
 
-        // Move lamports from PDA → recipient
-        {
-            let mut pda_lamports = pda_info.try_borrow_mut_lamports()?;
-            let mut recipient_lamports = recipient_info.try_borrow_mut_lamports()?;
+        // Update PDA state
+        pda_account.amount = pda_account.amount.checked_sub(amount_to_withdraw).unwrap();
 
-            require!(
-                **pda_lamports >= amount_to_withdraw,
-                ErrorCode::InsufficientPdaLamports
-            );
-
-            **pda_lamports -= amount_to_withdraw;
-            **recipient_lamports += amount_to_withdraw;
-        }
-
-        // Update logical balance
-        pda.amount = pda
-            .amount
-            .checked_sub(amount_to_withdraw)
-            .ok_or(ErrorCode::ArithmeticOverflow)?;
-
-        // If balance reaches zero → close PDA
-        if pda.amount == 0 {
-            let mut pda_lamports = pda_info.try_borrow_mut_lamports()?;
-            let mut sender_lamports = sender_info.try_borrow_mut_lamports()?;
-
-            let remaining = **pda_lamports;
-            if remaining > 0 {
-                **sender_lamports = sender_lamports
-                    .checked_add(remaining)
-                    .ok_or(ErrorCode::ArithmeticOverflow)?;
-                **pda_lamports = 0;
-            }
-
-            pda_info.resize(0)?;
-            pda_info.assign(&system_program::ID);
+        // Close PDA if empty
+        if pda_account.amount == 0 {
+            **ctx.accounts.sender.lamports.borrow_mut() = ctx
+                .accounts
+                .sender
+                .lamports()
+                .checked_add(pda_info.lamports())
+                .unwrap();
+            **pda_info.lamports.borrow_mut() = 0;
+            let _ = pda_info.try_borrow_mut_data()?.fill(0);
         }
 
         Ok(())
     }
 }
 
-/// PDA state
 #[account]
 pub struct BalanceHolderPDA {
     pub sender: Pubkey,
@@ -115,13 +104,13 @@ pub struct BalanceHolderPDA {
     pub amount: u64,
 }
 
-/// Deposit instruction accounts
 #[derive(Accounts)]
+#[instruction(amount_to_deposit: u64)]
 pub struct DepositCtx<'info> {
     #[account(mut)]
     pub sender: Signer<'info>,
 
-    /// CHECK: only used as seed
+    /// CHECK: used for PDA derivation
     pub recipient: UncheckedAccount<'info>,
 
     #[account(
@@ -136,14 +125,13 @@ pub struct DepositCtx<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Withdraw instruction accounts
 #[derive(Accounts)]
+#[instruction(amount_to_withdraw: u64)]
 pub struct WithdrawCtx<'info> {
     #[account(mut)]
     pub recipient: Signer<'info>,
 
-    /// CHECK: only used as seed
-    #[account(mut)] // ✅ must be mutable, since we refund rent lamports on PDA close
+    /// CHECK: used for PDA derivation
     pub sender: UncheckedAccount<'info>,
 
     #[account(
@@ -153,23 +141,15 @@ pub struct WithdrawCtx<'info> {
     )]
     pub balance_holder_pda: Account<'info, BalanceHolderPDA>,
 
-    pub rent: Sysvar<'info, Rent>,
+    pub system_program: Program<'info, System>,
 }
 
 #[error_code]
 pub enum ErrorCode {
-    #[msg("Deposit amount must be non-zero")]
-    ZeroDeposit,
-    #[msg("Withdrawal amount must be non-zero")]
-    ZeroWithdrawal,
-    #[msg("Recorded PDA balance is insufficient")]
-    InsufficientRecordedFunds,
-    #[msg("PDA has insufficient lamports")]
-    InsufficientPdaLamports,
-    #[msg("Sender mismatch")]
-    SenderMismatch,
-    #[msg("Recipient mismatch")]
-    RecipientMismatch,
-    #[msg("Arithmetic overflow/underflow")]
-    ArithmeticOverflow,
+    #[msg("Amount must be greater than zero.")]
+    ZeroAmount,
+    #[msg("Overflow in calculation.")]
+    Overflow,
+    #[msg("Not enough funds.")]
+    Underflow,
 }

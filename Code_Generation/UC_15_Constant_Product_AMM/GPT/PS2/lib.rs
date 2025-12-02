@@ -1,46 +1,62 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, TokenAccount, Token, MintTo, Transfer, Burn};
-use std::convert::TryInto;
+use anchor_spl::token::{self, Token, TokenAccount, Mint, SetAuthority};
+use anchor_spl::associated_token::AssociatedToken;
 
-declare_id!("BX8pVMzffzaGJfVZ7T8c736vEgTrDXb9pF2PtcTc9EBQ");
+
+declare_id!("6iWaDuUiGdAWfuXcStzETqD7eZ5ct8feikR9frcghaSj");
 
 #[program]
-pub mod amm_gpt {
+pub mod constant_product_amm {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, bump: u8) -> Result<()> {
-        let seeds = &[b"amm", &[bump]];
-        let signer = &[&seeds[..]];
+    // Initialize AMM
+    pub fn initialize(ctx: Context<InitializeCtx>) -> Result<()> {
+        let initializer = &ctx.accounts.initializer;
+        let amm_info = &mut ctx.accounts.amm_info;
 
-        // Initialize AMM info account
-        ctx.accounts.amm_info.supply = 0;
-        ctx.accounts.amm_info.reserve0 = 0;
-        ctx.accounts.amm_info.reserve1 = 0;
+        // Initialize AMM state
+        amm_info.mint0 = ctx.accounts.mint0.key();
+        amm_info.mint1 = ctx.accounts.mint1.key();
+        amm_info.token_account0 = ctx.accounts.token_account0.key();
+        amm_info.token_account1 = ctx.accounts.token_account1.key();
+        amm_info.reserve0 = 0;
+        amm_info.reserve1 = 0;
+        amm_info.ever_deposited = false;
+        amm_info.supply = 0;
+
+        // Bump is stored automatically by Anchor
+        amm_info.bump = ctx.bumps["amm_info"];
+
+        // Transfer ownership of token accounts to PDA
+        let cpi_ctx0 = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            SetAuthority {
+                account_or_mint: ctx.accounts.token_account0.to_account_info(),
+                current_authority: initializer.to_account_info(),
+            },
+        );
+        token::set_authority(cpi_ctx0, token::spl_token::instruction::AuthorityType::AccountOwner, Some(amm_info.key()))?;
+
+        let cpi_ctx1 = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            SetAuthority {
+                account_or_mint: ctx.accounts.token_account1.to_account_info(),
+                current_authority: initializer.to_account_info(),
+            },
+        );
+        token::set_authority(cpi_ctx1, token::spl_token::instruction::AuthorityType::AccountOwner, Some(amm_info.key()))?;
 
         Ok(())
     }
 
-    pub fn deposit(ctx: Context<Deposit>, amount0: u64, amount1: u64) -> Result<u64> {
-        let amm = &mut ctx.accounts.amm_info;
+    // Deposit liquidity
+    pub fn deposit(ctx: Context<DepositCtx>, amount0: u64, amount1: u64) -> Result<()> {
+        let amm_info = &mut ctx.accounts.amm_info;
+        let minted_pda = &mut ctx.accounts.minted_pda;
 
-        // Compute liquidity
-        let liquidity = if amm.supply == 0 {
-            ((amount0 as u128 * amount1 as u128).integer_sqrt() as u64)
-        } else {
-            std::cmp::min(
-                amount0.checked_mul(amm.supply).unwrap() / amm.reserve0,
-                amount1.checked_mul(amm.supply).unwrap() / amm.reserve1,
-            )
-        };
-
-        // Signer seeds for PDA
-        let bump = ctx.bumps.amm_info; // Correct field
-        let seeds = &[b"amm", &[bump]];
-        let signer = &[&seeds[..]];
-
-        // Transfer token0 in
+        // Transfer tokens from sender to AMM PDA
         let cpi_accounts0 = Transfer {
-            from: ctx.accounts.sender_token_account0.to_account_info(),
+            from: ctx.accounts.senders_token_account0.to_account_info(),
             to: ctx.accounts.pdas_token_account0.to_account_info(),
             authority: ctx.accounts.sender.to_account_info(),
         };
@@ -49,9 +65,8 @@ pub mod amm_gpt {
             amount0,
         )?;
 
-        // Transfer token1 in
         let cpi_accounts1 = Transfer {
-            from: ctx.accounts.sender_token_account1.to_account_info(),
+            from: ctx.accounts.senders_token_account1.to_account_info(),
             to: ctx.accounts.pdas_token_account1.to_account_info(),
             authority: ctx.accounts.sender.to_account_info(),
         };
@@ -60,122 +75,151 @@ pub mod amm_gpt {
             amount1,
         )?;
 
-        // Mint LP tokens to sender
-        let cpi_accounts_mint = MintTo {
-            mint: ctx.accounts.lp_mint.to_account_info(),
-            to: ctx.accounts.sender_lp.to_account_info(),
-            authority: ctx.accounts.amm_info.to_account_info(),
+        // Calculate minted LP tokens
+        let minted = if !amm_info.ever_deposited {
+            let minted_float = ((amount0 as u128) * (amount1 as u128)).integer_sqrt();
+            amm_info.ever_deposited = true;
+            minted_float as u64
+        } else {
+            let minted0 = (amount0 as u128)
+                .checked_mul(amm_info.supply as u128)
+                .unwrap()
+                .checked_div(amm_info.reserve0 as u128)
+                .unwrap();
+            let minted1 = (amount1 as u128)
+                .checked_mul(amm_info.supply as u128)
+                .unwrap()
+                .checked_div(amm_info.reserve1 as u128)
+                .unwrap();
+            std::cmp::min(minted0, minted1) as u64
         };
-        token::mint_to(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_mint,
-                signer,
-            ),
-            liquidity,
-        )?;
 
         // Update reserves and supply
-        amm.reserve0 = amm.reserve0.checked_add(amount0).unwrap();
-        amm.reserve1 = amm.reserve1.checked_add(amount1).unwrap();
-        amm.supply = amm.supply.checked_add(liquidity).unwrap();
+        amm_info.reserve0 = amm_info.reserve0.checked_add(amount0).unwrap();
+        amm_info.reserve1 = amm_info.reserve1.checked_add(amount1).unwrap();
+        amm_info.supply = amm_info.supply.checked_add(minted).unwrap();
 
-        Ok(liquidity)
+        // Update minted PDA
+        minted_pda.minted = minted_pda.minted.checked_add(minted).unwrap();
+
+        Ok(())
     }
 
-    pub fn redeem(ctx: Context<Redeem>, amount: u64) -> Result<(u64, u64)> {
-        let amm = &mut ctx.accounts.amm_info;
+    // Redeem liquidity
+    // Redeem liquidity
+    pub fn redeem(ctx: Context<RedeemOrSwapCtx>, amount: u64) -> Result<()> {
+        let minted_pda = &mut ctx.accounts.minted_pda;
 
-        let amount0 = amount.checked_mul(amm.reserve0).unwrap() / amm.supply;
-        let amount1 = amount.checked_mul(amm.reserve1).unwrap() / amm.supply;
+        require!(minted_pda.minted >= amount, ErrorCode::InsufficientLPTokens);
 
-        // Burn LP tokens
-        let bump = ctx.bumps.amm; // <-- correct bump
-        let seeds = &[b"amm", &[bump]];
-        let signer = &[&seeds[..]];
-        let cpi_accounts_burn = Burn {
-            from: ctx.accounts.sender_lp.to_account_info(),
-            mint: ctx.accounts.lp_mint.to_account_info(),
-            authority: ctx.accounts.sender.to_account_info(),
+        // Compute withdraw amounts
+        let (amount0, amount1) = {
+            let amm_info = &ctx.accounts.amm_info; // immutable borrow just for calculation
+            let amount0 = (amount as u128)
+                .checked_mul(amm_info.reserve0 as u128)
+                .unwrap()
+                .checked_div(amm_info.supply as u128)
+                .unwrap() as u64;
+            let amount1 = (amount as u128)
+                .checked_mul(amm_info.reserve1 as u128)
+                .unwrap()
+                .checked_div(amm_info.supply as u128)
+                .unwrap() as u64;
+            (amount0, amount1)
         };
-        token::burn(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_burn,
-                signer,
-            ),
-            amount,
-        )?;
 
-        // Transfer token0 out
+        // Bind keys for PDA seeds
+        let mint0_key = ctx.accounts.mint0.key();
+        let mint1_key = ctx.accounts.mint1.key();
+        let seeds = &[
+            b"amm",
+            mint0_key.as_ref(),
+            mint1_key.as_ref(),
+            &[ctx.accounts.amm_info.bump],
+        ];
+
+        // Transfer tokens from AMM to sender
         let cpi_accounts0 = Transfer {
             from: ctx.accounts.pdas_token_account0.to_account_info(),
-            to: ctx.accounts.sender_token_account0.to_account_info(),
+            to: ctx.accounts.senders_token_account0.to_account_info(),
             authority: ctx.accounts.amm_info.to_account_info(),
         };
         token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts0,
-                signer,
-            ),
+            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts0, &[seeds]),
             amount0,
         )?;
 
-        // Transfer token1 out
         let cpi_accounts1 = Transfer {
             from: ctx.accounts.pdas_token_account1.to_account_info(),
-            to: ctx.accounts.sender_token_account1.to_account_info(),
+            to: ctx.accounts.senders_token_account1.to_account_info(),
             authority: ctx.accounts.amm_info.to_account_info(),
         };
         token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts1,
-                signer,
-            ),
+            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts1, &[seeds]),
             amount1,
         )?;
 
-        amm.reserve0 = amm.reserve0.checked_sub(amount0).unwrap();
-        amm.reserve1 = amm.reserve1.checked_sub(amount1).unwrap();
-        amm.supply = amm.supply.checked_sub(amount).unwrap();
+        // Update mutable state in separate scope
+        {
+            let amm_info = &mut ctx.accounts.amm_info;
+            amm_info.reserve0 = amm_info.reserve0.checked_sub(amount0).unwrap();
+            amm_info.reserve1 = amm_info.reserve1.checked_sub(amount1).unwrap();
+            amm_info.supply = amm_info.supply.checked_sub(amount).unwrap();
+        }
 
-        Ok((amount0, amount1))
+        // Update minted PDA
+        minted_pda.minted = minted_pda.minted.checked_sub(amount).unwrap();
+
+        Ok(())
     }
 
-    pub fn swap(ctx: Context<Swap>, amount_in: u64, is_mint0: bool) -> Result<u64> {
-        let amm = &mut ctx.accounts.amm_info;
+    // Swap tokens
+    pub fn swap(ctx: Context<RedeemOrSwapCtx>, is_mint0: bool, amount_in: u64, min_out_amount: u64) -> Result<()> {
+        // Compute swap amounts using immutable borrow
+        let (amount_out, new_reserves) = {
+            let amm_info = &ctx.accounts.amm_info;
+            let (reserve_in, reserve_out) = if is_mint0 {
+                (amm_info.reserve0 as u128, amm_info.reserve1 as u128)
+            } else {
+                (amm_info.reserve1 as u128, amm_info.reserve0 as u128)
+            };
+            let amount_in_u128 = amount_in as u128;
+            let k = reserve_in.checked_mul(reserve_out).unwrap();
+            let new_reserve_in = reserve_in.checked_add(amount_in_u128).unwrap();
+            let new_reserve_out = k.checked_div(new_reserve_in).unwrap();
+            let amount_out = reserve_out.checked_sub(new_reserve_out).unwrap() as u64;
 
-        let (reserve_in, reserve_out, sender_token_in, pdas_token_out) = if is_mint0 {
-            (
-                &mut amm.reserve0,
-                &mut amm.reserve1,
-                &ctx.accounts.sender_token_account0,
-                &ctx.accounts.pdas_token_account1,
-            )
-        } else {
-            (
-                &mut amm.reserve1,
-                &mut amm.reserve0,
-                &ctx.accounts.sender_token_account1,
-                &ctx.accounts.pdas_token_account0,
-            )
+            require!(amount_out >= min_out_amount, ErrorCode::SlippageExceeded);
+
+            if is_mint0 {
+                (amount_out, (reserve_in + amount_in_u128, reserve_out - new_reserve_out))
+            } else {
+                (amount_out, (reserve_out - new_reserve_out, reserve_in + amount_in_u128))
+            }
         };
 
-        let amount_in_with_fee = amount_in.checked_mul(997).unwrap() / 1000;
-        let numerator = amount_in_with_fee.checked_mul(*reserve_out).unwrap();
-        let denominator = (*reserve_in).checked_add(amount_in_with_fee).unwrap();
-        let amount_out = numerator.checked_div(denominator).unwrap();
+        // Bind PDA seeds
+        let mint0_key = ctx.accounts.mint0.key();
+        let mint1_key = ctx.accounts.mint1.key();
+        let seeds = &[
+            b"amm",
+            mint0_key.as_ref(),
+            mint1_key.as_ref(),
+            &[ctx.accounts.amm_info.bump],
+        ];
 
-        let bump = ctx.bumps.amm;
-        let seeds = &[b"amm", &[bump]];
-        let signer = &[&seeds[..]];
-
-        // Transfer in
+        // Transfer input tokens from sender to AMM
         let cpi_accounts_in = Transfer {
-            from: sender_token_in.to_account_info(),
-            to: if is_mint0 { ctx.accounts.pdas_token_account0.to_account_info() } else { ctx.accounts.pdas_token_account1.to_account_info() },
+            from: if is_mint0 {
+                ctx.accounts.senders_token_account0.to_account_info()
+            } else {
+                ctx.accounts.senders_token_account1.to_account_info()
+            },
+            to: if is_mint0 {
+                ctx.accounts.pdas_token_account0.to_account_info()
+            } else {
+                ctx.accounts.pdas_token_account1.to_account_info()
+            },
             authority: ctx.accounts.sender.to_account_info(),
         };
         token::transfer(
@@ -183,110 +227,174 @@ pub mod amm_gpt {
             amount_in,
         )?;
 
-        // Transfer out
+        // Transfer output tokens from AMM to sender
         let cpi_accounts_out = Transfer {
-            from: if is_mint0 { ctx.accounts.pdas_token_account1.to_account_info() } else { ctx.accounts.pdas_token_account0.to_account_info() },
-            to: if is_mint0 { ctx.accounts.sender_token_account1.to_account_info() } else { ctx.accounts.sender_token_account0.to_account_info() },
+            from: if is_mint0 {
+                ctx.accounts.pdas_token_account1.to_account_info()
+            } else {
+                ctx.accounts.pdas_token_account0.to_account_info()
+            },
+            to: if is_mint0 {
+                ctx.accounts.senders_token_account1.to_account_info()
+            } else {
+                ctx.accounts.senders_token_account0.to_account_info()
+            },
             authority: ctx.accounts.amm_info.to_account_info(),
         };
         token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_out,
-                signer,
-            ),
+            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts_out, &[seeds]),
             amount_out,
         )?;
 
-        *reserve_in = reserve_in.checked_add(amount_in).unwrap();
-        *reserve_out = reserve_out.checked_sub(amount_out).unwrap();
+        // Update mutable state in separate scope
+        {
+            let amm_info = &mut ctx.accounts.amm_info;
+            if is_mint0 {
+                amm_info.reserve0 = amm_info.reserve0.checked_add(amount_in).unwrap();
+                amm_info.reserve1 = amm_info.reserve1.checked_sub(amount_out).unwrap();
+            } else {
+                amm_info.reserve1 = amm_info.reserve1.checked_add(amount_in).unwrap();
+                amm_info.reserve0 = amm_info.reserve0.checked_sub(amount_out).unwrap();
+            }
+        }
 
-        Ok(amount_out)
+        Ok(())
     }
 }
 
-// Helper trait for integer square root
-trait IntegerSqrt {
-    fn integer_sqrt(self) -> Self;
+// --------------------------- Contexts ---------------------------
+
+#[derive(Accounts)]
+pub struct InitializeCtx<'info> {
+    #[account(mut)]
+    pub initializer: Signer<'info>,
+
+    #[account(
+        init,
+        seeds = [b"amm", mint0.key().as_ref(), mint1.key().as_ref()],
+        bump,
+        payer = initializer,
+        space = 8 + 176
+    )]
+    pub amm_info: Account<'info, AmmInfo>,
+
+    pub mint0: Account<'info, Mint>,
+    pub mint1: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub token_account0: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub token_account1: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
-impl IntegerSqrt for u128 {
-    fn integer_sqrt(self) -> Self {
-        (self as f64).sqrt() as u128
-    }
+#[derive(Accounts)]
+pub struct DepositCtx<'info> {
+    #[account(mut)]
+    pub sender: Signer<'info>, // signer
+
+    pub mint0: Account<'info, Mint>,
+    pub mint1: Account<'info, Mint>,
+
+    #[account(mut, seeds = [b"amm", mint0.key().as_ref(), mint1.key().as_ref()], bump)]
+    pub amm_info: Account<'info, AmmInfo>,
+
+    #[account(mut, seeds = [b"minted", sender.key().as_ref()], bump)]
+    pub minted_pda: Account<'info, MintedPDA>,
+
+    #[account(mut)]
+    pub senders_token_account0: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub senders_token_account1: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub pdas_token_account0: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub pdas_token_account1: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+}
+
+#[derive(Accounts)]
+pub struct RedeemOrSwapCtx<'info> {
+    #[account(mut)]
+    pub sender: Signer<'info>, // signer
+
+    pub mint0: Account<'info, Mint>,
+    pub mint1: Account<'info, Mint>,
+
+    #[account(mut, seeds = [b"amm", mint0.key().as_ref(), mint1.key().as_ref()], bump)]
+    pub amm_info: Account<'info, AmmInfo>,
+
+    #[account(mut, seeds = [b"minted", sender.key().as_ref()], bump)]
+    pub minted_pda: Account<'info, MintedPDA>,
+
+    #[account(mut)]
+    pub senders_token_account0: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub senders_token_account1: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub pdas_token_account0: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub pdas_token_account1: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+}
+
+
+// --------------------------- Accounts ---------------------------
+
+#[account]
+pub struct AmmInfo {
+    pub mint0: Pubkey,
+    pub mint1: Pubkey,
+    pub token_account0: Pubkey,
+    pub token_account1: Pubkey,
+    pub reserve0: u64,
+    pub reserve1: u64,
+    pub ever_deposited: bool,
+    pub supply: u64,
+    pub bump: u8,
 }
 
 #[account]
-pub struct AMM {
-    pub supply: u64,
-    pub reserve0: u64,
-    pub reserve1: u64,
+pub struct MintedPDA {
+    pub minted: u64,
+    pub bump: u8,
 }
 
-#[derive(Accounts)]
-pub struct Initialize<'info> {
-    #[account(init, payer = payer, space = 8 + 24, seeds = [b"amm"], bump)]
-    pub amm_info: Account<'info, AMM>,
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    pub system_program: Program<'info, System>,
+// --------------------------- Errors ---------------------------
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Not enough LP tokens")]
+    InsufficientLPTokens,
+    #[msg("Slippage exceeded")]
+    SlippageExceeded,
 }
 
-#[derive(Accounts)]
-pub struct Deposit<'info> {
-    #[account(mut, seeds = [b"amm"], bump)]
-    pub amm_info: Account<'info, AMM>,
-    #[account(mut)]
-    pub sender: Signer<'info>,
-    #[account(mut)]
-    pub sender_token_account0: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub sender_token_account1: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub pdas_token_account0: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub pdas_token_account1: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub lp_mint: Account<'info, Mint>,
-    #[account(mut)]
-    pub sender_lp: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
+// --------------------------- Helpers ---------------------------
+
+trait IntegerSquareRoot {
+    fn integer_sqrt(self) -> Self;
 }
 
-#[derive(Accounts)]
-pub struct Redeem<'info> {
-    #[account(mut, seeds = [b"amm"], bump)]
-    pub amm_info: Account<'info, AMM>,
-    #[account(mut)]
-    pub sender: Signer<'info>,
-    #[account(mut)]
-    pub sender_token_account0: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub sender_token_account1: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub pdas_token_account0: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub pdas_token_account1: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub lp_mint: Account<'info, Mint>,
-    #[account(mut)]
-    pub sender_lp: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct Swap<'info> {
-    #[account(mut, seeds = [b"amm"], bump)]
-    pub amm_info: Account<'info, AMM>,
-    #[account(mut)]
-    pub sender: Signer<'info>,
-    #[account(mut)]
-    pub sender_token_account0: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub sender_token_account1: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub pdas_token_account0: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub pdas_token_account1: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
+impl IntegerSquareRoot for u128 {
+    fn integer_sqrt(self) -> Self {
+        let mut x = self;
+        let mut y = (x + 1) / 2;
+        while y < x {
+            x = y;
+            y = (x + self / x) / 2;
+        }
+        x
+    }
 }

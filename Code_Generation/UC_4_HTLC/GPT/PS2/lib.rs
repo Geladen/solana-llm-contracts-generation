@@ -1,245 +1,143 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::keccak::hash as keccak_hash;
-use anchor_lang::system_program;
+use anchor_lang::solana_program::{keccak};
 
-declare_id!("4yoVCMUwibH17JvUPqJEXXw35aa5SuecjPp4Yi4FeeJF");
+declare_id!("8JTGYRpj23beoJ6JqXC3aGnSTEV6vvTDVNzQvUzYGzr9");
 
 #[program]
-pub mod htlc_gpt {
+pub mod htlc {
     use super::*;
 
+    /// Initialize a new HTLC
     pub fn initialize(
         ctx: Context<InitializeCtx>,
         hashed_secret: [u8; 32],
         delay: u64,
         amount: u64,
     ) -> Result<()> {
-        if amount == 0 {
-            return Err(ErrorCode::AmountMustBeNonZero.into());
-        }
-
-        let clock = Clock::get()?;
         let htlc = &mut ctx.accounts.htlc_info;
+
         htlc.owner = ctx.accounts.owner.key();
         htlc.verifier = ctx.accounts.verifier.key();
         htlc.hashed_secret = hashed_secret;
-        htlc.reveal_timeout = clock
-            .slot
-            .checked_add(delay)
-            .ok_or(ErrorCode::Overflow)?;
+        let current_slot = Clock::get()?.slot;
+        htlc.reveal_timeout = current_slot + delay;
         htlc.amount = amount;
 
-        // Transfer lamports from owner → PDA
-        let cpi_accounts = system_program::Transfer {
-            from: ctx.accounts.owner.to_account_info(),
-            to: ctx.accounts.htlc_info.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
-        system_program::transfer(cpi_ctx, amount)?;
-
+        // NO manual lamports transfer needed!
+        // The `init` attribute already funds the PDA with enough lamports from `owner`
         Ok(())
     }
 
+    /// Reveal the secret to claim HTLC funds
     pub fn reveal(ctx: Context<RevealCtx>, secret: String) -> Result<()> {
-        let (amount, owner_key, verifier_key, bump) = {
-            let htlc = &mut ctx.accounts.htlc_info;
-            let clock = Clock::get()?;
-            if clock.slot > htlc.reveal_timeout {
-                return Err(ErrorCode::RevealDeadlinePassed.into());
-            }
-            if htlc.amount == 0 {
-                return Err(ErrorCode::AlreadyClaimed.into());
-            }
-
-            let secret_bytes = decode_secret_string(&secret)?;
-            let computed = keccak_hash(&secret_bytes).0;
-            if computed != htlc.hashed_secret {
-                return Err(ErrorCode::HashMismatch.into());
-            }
-
-            (htlc.amount, htlc.owner, htlc.verifier, ctx.bumps.htlc_info)
-        };
-
-        // Transfer from PDA → owner
-        let seeds = &[owner_key.as_ref(), verifier_key.as_ref(), &[bump]];
-        let signer_seeds = &[seeds.as_ref()];
-
-        let cpi_accounts = system_program::Transfer {
-            from: ctx.accounts.htlc_info.to_account_info(),
-            to: ctx.accounts.owner.to_account_info(),
-        };
-        let cpi_ctx =
-            CpiContext::new_with_signer(ctx.accounts.system_program.to_account_info(), cpi_accounts, signer_seeds);
-        system_program::transfer(cpi_ctx, amount)?;
-
         let htlc = &mut ctx.accounts.htlc_info;
+
+        // Verify hash
+        let hash = keccak::hash(secret.as_bytes()).0;
+        require!(hash == htlc.hashed_secret, HtlcError::InvalidSecret);
+
+        let amount = htlc.amount;
+        require!(amount > 0, HtlcError::AlreadyClaimed);
         htlc.amount = 0;
-        htlc.hashed_secret = [0u8; 32];
-        htlc.reveal_timeout = 0;
+
+        // Transfer lamports from PDA to owner
+        **ctx.accounts.htlc_info.to_account_info().try_borrow_mut_lamports()? -= amount;
+        **ctx.accounts.owner.try_borrow_mut_lamports()? += amount;
 
         Ok(())
     }
 
+    /// Timeout claim after reveal deadline
     pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
-        let (amount, owner_key, verifier_key, bump) = {
-            let htlc = &mut ctx.accounts.htlc_info;
-            let clock = Clock::get()?;
-            if clock.slot <= htlc.reveal_timeout {
-                return Err(ErrorCode::RevealStillActive.into());
-            }
-            if htlc.amount == 0 {
-                return Err(ErrorCode::AlreadyClaimed.into());
-            }
-
-            (htlc.amount, htlc.owner, htlc.verifier, ctx.bumps.htlc_info)
-        };
-
-        // Transfer from PDA → verifier
-        let seeds = &[owner_key.as_ref(), verifier_key.as_ref(), &[bump]];
-        let signer_seeds = &[seeds.as_ref()];
-
-        let cpi_accounts = system_program::Transfer {
-            from: ctx.accounts.htlc_info.to_account_info(),
-            to: ctx.accounts.verifier.to_account_info(),
-        };
-        let cpi_ctx =
-            CpiContext::new_with_signer(ctx.accounts.system_program.to_account_info(), cpi_accounts, signer_seeds);
-        system_program::transfer(cpi_ctx, amount)?;
-
         let htlc = &mut ctx.accounts.htlc_info;
+        let clock = Clock::get()?;
+        require!(clock.slot > htlc.reveal_timeout, HtlcError::TimeoutNotReached);
+
+        let amount = htlc.amount;
+        require!(amount > 0, HtlcError::AlreadyClaimed);
         htlc.amount = 0;
-        htlc.hashed_secret = [0u8; 32];
-        htlc.reveal_timeout = 0;
+
+        // Transfer lamports from PDA to verifier
+        **ctx.accounts.htlc_info.to_account_info().try_borrow_mut_lamports()? -= amount;
+        **ctx.accounts.verifier.try_borrow_mut_lamports()? += amount;
 
         Ok(())
     }
 }
 
-/// Accounts for initialize
 #[derive(Accounts)]
-#[instruction(hashed_secret: [u8; 32], delay: u64, amount: u64)]
+#[instruction(hashed_secret: [u8;32], delay: u64, amount: u64)]
 pub struct InitializeCtx<'info> {
-    #[account(mut)]
-    pub owner: Signer<'info>,
+    /// CHECK: The committer signing the transaction
+    #[account(mut, signer)]
+    pub owner: AccountInfo<'info>,
 
-    /// CHECK: verifier only stored in PDA
-    pub verifier: UncheckedAccount<'info>,
+    /// CHECK: The receiver/verifier
+    pub verifier: AccountInfo<'info>,
 
     #[account(
         init,
+        seeds = [owner.key().as_ref(), verifier.key().as_ref()],
+        bump,
         payer = owner,
-        space = 8 + HtlcPDA::LEN,
+        space = 8 + std::mem::size_of::<HtlcPDA>(), // 8 for discriminator
+    )]
+    pub htlc_info: Account<'info, HtlcPDA>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct RevealCtx<'info> {
+    /// CHECK: Must be the owner (committer) signing
+    #[account(mut, signer)]
+    pub owner: AccountInfo<'info>,
+
+    /// CHECK: Verifier reference
+    pub verifier: AccountInfo<'info>,
+
+    #[account(
+        mut,
         seeds = [owner.key().as_ref(), verifier.key().as_ref()],
         bump
     )]
     pub htlc_info: Account<'info, HtlcPDA>,
-
-    pub system_program: Program<'info, System>,
 }
 
-/// Accounts for reveal
-#[derive(Accounts)]
-pub struct RevealCtx<'info> {
-    #[account(mut)]
-    pub owner: Signer<'info>,
-
-    /// CHECK: verifier only used for PDA seeds
-    pub verifier: UncheckedAccount<'info>,
-
-    #[account(
-        mut,
-        seeds = [owner.key().as_ref(), verifier.key().as_ref()],
-        bump,
-        has_one = owner,
-        has_one = verifier
-    )]
-    pub htlc_info: Account<'info, HtlcPDA>,
-
-    pub system_program: Program<'info, System>,
-}
-
-/// Accounts for timeout
 #[derive(Accounts)]
 pub struct TimeoutCtx<'info> {
-    #[account(mut)]
-    pub verifier: Signer<'info>,
+    /// CHECK: Must be the verifier (receiver) signing
+    #[account(mut, signer)]
+    pub verifier: AccountInfo<'info>,
 
-    /// CHECK: owner only used for PDA seeds
-    pub owner: UncheckedAccount<'info>,
+    /// CHECK: Owner reference
+    pub owner: AccountInfo<'info>,
 
     #[account(
         mut,
         seeds = [owner.key().as_ref(), verifier.key().as_ref()],
-        bump,
-        has_one = owner,
-        has_one = verifier
+        bump
     )]
     pub htlc_info: Account<'info, HtlcPDA>,
-
-    pub system_program: Program<'info, System>,
 }
 
-/// PDA data
 #[account]
 pub struct HtlcPDA {
-    pub owner: Pubkey,
-    pub verifier: Pubkey,
-    pub hashed_secret: [u8; 32],
-    pub reveal_timeout: u64,
-    pub amount: u64,
-}
-
-impl HtlcPDA {
-    pub const LEN: usize = 32 + 32 + 32 + 8 + 8;
-}
-
-// Helper functions
-fn decode_secret_string(s: &str) -> Result<Vec<u8>> {
-    let trimmed = s.trim();
-    let without_prefix = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-
-    if without_prefix.len() % 2 == 0 && without_prefix.chars().all(|c| c.is_ascii_hexdigit()) {
-        return decode_hex(without_prefix);
-    }
-
-    Ok(trimmed.as_bytes().to_vec())
-}
-
-fn decode_hex(s: &str) -> Result<Vec<u8>> {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(10 + (c - b'a')),
-            b'A'..=b'F' => Some(10 + (c - b'A')),
-            _ => None,
-        }
-    }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = val(bytes[i]).ok_or(ErrorCode::InvalidHexSecret)?;
-        let lo = val(bytes[i + 1]).ok_or(ErrorCode::InvalidHexSecret)?;
-        out.push((hi << 4) | lo);
-        i += 2;
-    }
-    Ok(out)
+    pub owner: Pubkey,            // 32
+    pub verifier: Pubkey,         // 32
+    pub hashed_secret: [u8; 32],  // 32
+    pub reveal_timeout: u64,      // 8
+    pub amount: u64,              // 8
 }
 
 #[error_code]
-pub enum ErrorCode {
-    #[msg("Hash mismatch (keccak(secret) != stored commitment)")]
-    HashMismatch,
-    #[msg("Reveal deadline has already passed")]
-    RevealDeadlinePassed,
-    #[msg("Timeout has not been reached yet (reveal still active)")]
-    RevealStillActive,
-    #[msg("No funds available in HTLC / already claimed")]
+pub enum HtlcError {
+    #[msg("The secret provided does not match the committed hash.")]
+    InvalidSecret,
+
+    #[msg("Reveal timeout has not yet been reached.")]
+    TimeoutNotReached,
+
+    #[msg("HTLC funds already claimed.")]
     AlreadyClaimed,
-    #[msg("Provided amount must be non-zero")]
-    AmountMustBeNonZero,
-    #[msg("Integer overflow")]
-    Overflow,
-    #[msg("Invalid hex in provided secret string")]
-    InvalidHexSecret,
 }

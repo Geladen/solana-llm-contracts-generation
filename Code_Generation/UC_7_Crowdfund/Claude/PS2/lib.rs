@@ -1,169 +1,182 @@
 use anchor_lang::prelude::*;
+use anchor_lang::system_program;
 
-declare_id!("AYzgbm9rHtWhoWe7TfZWx953cSFAQNmE2i4FBU6S8gng");
+declare_id!("6xdQBYz6mBAFECFMGj8KzxDQUNnqCb8fRnarccA5e4ib");
 
 #[program]
 pub mod crowdfund {
     use super::*;
 
-    /// Initialize a new crowdfunding campaign
-    /// Only callable by the campaign owner
     pub fn initialize(
-        ctx: Context<InitializeCtx>, 
-        campaign_name: String, 
-        end_donate_slot: u64, 
-        goal_in_lamports: u64
+        ctx: Context<InitializeCtx>,
+        campaign_name: String,
+        end_donate_slot: u64,
+        goal_in_lamports: u64,
     ) -> Result<()> {
-        let current_slot = Clock::get()?.slot;
-        
-        // Validate that end_donate_slot is in the future
+        // Validate campaign name length
         require!(
-            end_donate_slot > current_slot, 
+            campaign_name.len() > 0 && campaign_name.len() <= 32,
+            CrowdfundingError::InvalidCampaignName
+        );
+
+        // Validate end donate slot is in the future
+        let current_slot = Clock::get()?.slot;
+        require!(
+            end_donate_slot > current_slot,
             CrowdfundingError::InvalidEndSlot
         );
 
-        // Validate goal amount is positive
+        // Validate goal amount is greater than 0
         require!(
-            goal_in_lamports > 0, 
+            goal_in_lamports > 0,
             CrowdfundingError::InvalidGoalAmount
         );
 
-        // Initialize campaign PDA
         let campaign_pda = &mut ctx.accounts.campaign_pda;
         campaign_pda.campaign_name = campaign_name;
         campaign_pda.campaign_owner = ctx.accounts.campaign_owner.key();
         campaign_pda.end_donate_slot = end_donate_slot;
         campaign_pda.goal_in_lamports = goal_in_lamports;
 
+        msg!("Campaign initialized: {}", campaign_pda.campaign_name);
         Ok(())
     }
 
-    /// Donate to a campaign
-    /// Callable by any donor
     pub fn donate(
-        ctx: Context<DonateCtx>, 
-        _campaign_name: String, 
-        donated_lamports: u64
+        ctx: Context<DonateCtx>,
+        _campaign_name: String,
+        donated_lamports: u64,
     ) -> Result<()> {
-        let current_slot = Clock::get()?.slot;
-        
-        // Check if donation period is still active
-        require!(
-            current_slot <= ctx.accounts.campaign_pda.end_donate_slot,
-            CrowdfundingError::DonationPeriodEnded
-        );
-
-        // Validate donation amount is positive
+        // Validate donation amount
         require!(
             donated_lamports > 0,
             CrowdfundingError::InvalidDonationAmount
         );
 
+        let campaign_pda = &ctx.accounts.campaign_pda;
+        
+        // Check if donation period is still active
+        let current_slot = Clock::get()?.slot;
+        require!(
+            current_slot <= campaign_pda.end_donate_slot,
+            CrowdfundingError::DonationPeriodEnded
+        );
+
         // Transfer lamports from donor to campaign PDA
-        let transfer_instruction = anchor_lang::system_program::Transfer {
+        let transfer_instruction = system_program::Transfer {
             from: ctx.accounts.donor.to_account_info(),
             to: ctx.accounts.campaign_pda.to_account_info(),
         };
-        let transfer_ctx = CpiContext::new(
+
+        let cpi_ctx = CpiContext::new(
             ctx.accounts.system_program.to_account_info(),
             transfer_instruction,
         );
-        anchor_lang::system_program::transfer(transfer_ctx, donated_lamports)?;
 
-        // Update deposit PDA to track donor's contribution
+        system_program::transfer(cpi_ctx, donated_lamports)?;
+
+        // Update or initialize deposit PDA
         let deposit_pda = &mut ctx.accounts.deposit_pda;
         deposit_pda.total_donated = deposit_pda.total_donated.checked_add(donated_lamports)
             .ok_or(CrowdfundingError::MathOverflow)?;
 
+        msg!("Donation of {} lamports received from {}", donated_lamports, ctx.accounts.donor.key());
         Ok(())
     }
 
-    /// Withdraw funds from campaign (owner only, goal must be reached)
     pub fn withdraw(
-        ctx: Context<WithdrawCtx>, 
-        _campaign_name: String
+        ctx: Context<WithdrawCtx>,
+        _campaign_name: String,
     ) -> Result<()> {
-        let campaign_pda = &ctx.accounts.campaign_pda;
-        
-        // Calculate rent exemption minimum for campaign PDA
-        let rent = Rent::get()?;
-        let campaign_pda_info = ctx.accounts.campaign_pda.to_account_info();
-        let rent_exempt_minimum = rent.minimum_balance(campaign_pda_info.data_len());
-        
-        // Get current campaign balance
-        let campaign_balance = ctx.accounts.campaign_pda.to_account_info().lamports();
-        
-        // Check if goal was reached (excluding rent exemption from goal calculation)
-        let available_balance = campaign_balance.saturating_sub(rent_exempt_minimum);
+        let campaign_pda = &mut ctx.accounts.campaign_pda;
+        let campaign_owner = &ctx.accounts.campaign_owner;
+
+        // Check if the goal has been reached
+        let campaign_balance = campaign_pda.to_account_info().lamports();
         require!(
-            available_balance >= campaign_pda.goal_in_lamports,
+            campaign_balance >= campaign_pda.goal_in_lamports,
             CrowdfundingError::GoalNotReached
         );
 
-        // Calculate withdrawable amount (total balance minus rent exemption)
-        let withdrawable_amount = available_balance;
+        // Calculate rent-exempt minimum for the campaign PDA
+        let rent = Rent::get()?;
+        let campaign_account_info = campaign_pda.to_account_info();
+        let rent_exempt_minimum = rent.minimum_balance(campaign_account_info.data_len());
+
+        // Calculate withdrawable amount (total balance minus rent-exempt minimum)
+        let withdrawable_amount = campaign_balance.saturating_sub(rent_exempt_minimum);
         
         require!(
             withdrawable_amount > 0,
-            CrowdfundingError::NoFundsToWithdraw
+            CrowdfundingError::InsufficientFunds
         );
 
-        // Transfer withdrawable funds from campaign PDA to owner
-        **ctx.accounts.campaign_pda.to_account_info().try_borrow_mut_lamports()? -= withdrawable_amount;
-        **ctx.accounts.campaign_owner.to_account_info().try_borrow_mut_lamports()? += withdrawable_amount;
+        // Transfer withdrawable lamports from campaign PDA to campaign owner
+        **campaign_pda.to_account_info().try_borrow_mut_lamports()? -= withdrawable_amount;
+        **campaign_owner.to_account_info().try_borrow_mut_lamports()? += withdrawable_amount;
 
+        msg!("Campaign owner withdrew {} lamports", withdrawable_amount);
         Ok(())
     }
 
-    /// Reclaim donated funds (donor only, goal must not be reached)
     pub fn reclaim(
-        ctx: Context<ReclaimCtx>, 
-        _campaign_name: String
+        ctx: Context<ReclaimCtx>,
+        _campaign_name: String,
     ) -> Result<()> {
         let campaign_pda = &ctx.accounts.campaign_pda;
         let deposit_pda = &ctx.accounts.deposit_pda;
-        
-        // Check if goal was NOT reached
-        let campaign_balance = ctx.accounts.campaign_pda.to_account_info().lamports();
-        require!(
-            campaign_balance < campaign_pda.goal_in_lamports,
-            CrowdfundingError::GoalAlreadyReached
-        );
+        let donor = &ctx.accounts.donor;
 
-        // Get the amount to reclaim
-        let reclaim_amount = deposit_pda.total_donated;
+        // Check if the goal was NOT reached
+        let campaign_balance = campaign_pda.to_account_info().lamports();
         
-        // Ensure there's something to reclaim
-        require!(
-            reclaim_amount > 0,
-            CrowdfundingError::NothingToReclaim
-        );
-
-        // Calculate rent exemption minimum for campaign PDA
+        // Calculate rent-exempt minimum for the campaign PDA
         let rent = Rent::get()?;
-        let campaign_pda_info = ctx.accounts.campaign_pda.to_account_info();
-        let rent_exempt_minimum = rent.minimum_balance(campaign_pda_info.data_len());
-
-        // Ensure we don't drain the campaign PDA below rent exemption
+        let campaign_account_info = campaign_pda.to_account_info();
+        let rent_exempt_minimum = rent.minimum_balance(campaign_account_info.data_len());
+        
+        // Available balance for reclaiming (excluding rent-exempt minimum)
+        let available_balance = campaign_balance.saturating_sub(rent_exempt_minimum);
+        
         require!(
-            campaign_balance.saturating_sub(reclaim_amount) >= rent_exempt_minimum,
+            available_balance < campaign_pda.goal_in_lamports,
+            CrowdfundingError::GoalWasReached
+        );
+
+        // Check if donation period has ended
+        let current_slot = Clock::get()?.slot;
+        require!(
+            current_slot > campaign_pda.end_donate_slot,
+            CrowdfundingError::DonationPeriodActive
+        );
+
+        let donated_amount = deposit_pda.total_donated;
+        require!(
+            donated_amount > 0,
+            CrowdfundingError::NoDonationToReclaim
+        );
+
+        // Ensure we don't withdraw below rent-exempt minimum
+        require!(
+            available_balance >= donated_amount,
             CrowdfundingError::InsufficientFundsForReclaim
         );
 
         // Transfer donated amount back to donor from campaign PDA
-        **ctx.accounts.campaign_pda.to_account_info().try_borrow_mut_lamports()? -= reclaim_amount;
-        **ctx.accounts.donor.to_account_info().try_borrow_mut_lamports()? += reclaim_amount;
+        **campaign_pda.to_account_info().try_borrow_mut_lamports()? -= donated_amount;
+        **donor.to_account_info().try_borrow_mut_lamports()? += donated_amount;
 
-        // Close deposit PDA and return rent to donor
-        let deposit_lamports = ctx.accounts.deposit_pda.to_account_info().lamports();
-        **ctx.accounts.deposit_pda.to_account_info().try_borrow_mut_lamports()? = 0;
-        **ctx.accounts.donor.to_account_info().try_borrow_mut_lamports()? += deposit_lamports;
+        // Close deposit PDA and transfer rent back to donor
+        let deposit_lamports = deposit_pda.to_account_info().lamports();
+        **deposit_pda.to_account_info().try_borrow_mut_lamports()? = 0;
+        **donor.to_account_info().try_borrow_mut_lamports()? += deposit_lamports;
 
+        msg!("Donor reclaimed {} lamports", donated_amount);
         Ok(())
     }
 }
 
-// Context structs for each instruction
+// Context Structs
 #[derive(Accounts)]
 #[instruction(campaign_name: String)]
 pub struct InitializeCtx<'info> {
@@ -199,7 +212,7 @@ pub struct DonateCtx<'info> {
         init_if_needed,
         payer = donor,
         space = 8 + DepositPDA::INIT_SPACE,
-        seeds = ["deposit".as_ref(), campaign_name.as_ref(), donor.key().as_ref()],
+        seeds = [b"deposit".as_ref(), campaign_name.as_ref(), donor.key().as_ref()],
         bump
     )]
     pub deposit_pda: Account<'info, DepositPDA>,
@@ -212,7 +225,7 @@ pub struct DonateCtx<'info> {
 pub struct WithdrawCtx<'info> {
     #[account(
         mut,
-        constraint = campaign_owner.key() == campaign_pda.campaign_owner @ CrowdfundingError::UnauthorizedAccess
+        constraint = campaign_owner.key() == campaign_pda.campaign_owner @ CrowdfundingError::UnauthorizedWithdraw
     )]
     pub campaign_owner: Signer<'info>,
 
@@ -239,14 +252,14 @@ pub struct ReclaimCtx<'info> {
 
     #[account(
         mut,
-        close = donor,
-        seeds = ["deposit".as_ref(), campaign_name.as_ref(), donor.key().as_ref()],
-        bump
+        seeds = [b"deposit".as_ref(), campaign_name.as_ref(), donor.key().as_ref()],
+        bump,
+        close = donor
     )]
     pub deposit_pda: Account<'info, DepositPDA>,
 }
 
-// Account state structures
+// Account Structs
 #[account]
 #[derive(InitSpace)]
 pub struct CampaignPDA {
@@ -263,39 +276,45 @@ pub struct DepositPDA {
     pub total_donated: u64,
 }
 
-// Custom error types
+// Error Codes
 #[error_code]
 pub enum CrowdfundingError {
-    #[msg("End donation slot must be in the future")]
+    #[msg("Invalid campaign name. Must be 1-32 characters.")]
+    InvalidCampaignName,
+
+    #[msg("End donate slot must be in the future.")]
     InvalidEndSlot,
-    
-    #[msg("Goal amount must be greater than 0")]
+
+    #[msg("Goal amount must be greater than 0.")]
     InvalidGoalAmount,
-    
-    #[msg("Donation period has ended")]
-    DonationPeriodEnded,
-    
-    #[msg("Donation amount must be greater than 0")]
+
+    #[msg("Donation amount must be greater than 0.")]
     InvalidDonationAmount,
-    
-    #[msg("Goal has not been reached, cannot withdraw")]
+
+    #[msg("Donation period has ended.")]
+    DonationPeriodEnded,
+
+    #[msg("Goal has not been reached.")]
     GoalNotReached,
-    
-    #[msg("Goal has already been reached, cannot reclaim")]
-    GoalAlreadyReached,
-    
-    #[msg("Nothing to reclaim")]
-    NothingToReclaim,
-    
-    #[msg("Insufficient funds in campaign for reclaim")]
-    InsufficientFundsForReclaim,
-    
-    #[msg("No funds available to withdraw")]
-    NoFundsToWithdraw,
-    
-    #[msg("Unauthorized access")]
-    UnauthorizedAccess,
-    
-    #[msg("Mathematical overflow")]
+
+    #[msg("Goal was already reached.")]
+    GoalWasReached,
+
+    #[msg("Donation period is still active.")]
+    DonationPeriodActive,
+
+    #[msg("No donation to reclaim.")]
+    NoDonationToReclaim,
+
+    #[msg("Unauthorized withdrawal attempt.")]
+    UnauthorizedWithdraw,
+
+    #[msg("Math operation overflow.")]
     MathOverflow,
+
+    #[msg("Insufficient funds for withdrawal.")]
+    InsufficientFunds,
+
+    #[msg("Insufficient funds available for reclaim.")]
+    InsufficientFundsForReclaim,
 }

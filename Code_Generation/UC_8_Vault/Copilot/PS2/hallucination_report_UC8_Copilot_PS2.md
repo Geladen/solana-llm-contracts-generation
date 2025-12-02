@@ -1,26 +1,17 @@
 ## Identified Hallucinations
 
-### Context Devition: Dead Code
+### Context Deviation: Inconsistency
 **Description:** 
 
-The code declares a vault_key that is never used, resulting in dead code.
+The code unnecessarily assigns mutable qualifiers to variables that are never modified.
 
 **Code Example:**
 ```rust
-let vault_key = ctx.accounts.vault_info.key();
+    let mut from_account = vault_ai; // owned clone
+    let mut to_account = receiver_ai; // owned clone
 ```
 
-### Knowledge Conflicting: API Knowledge
-**Description:** 
-
-The code uses a deprecated import.
-
-**Code Example:**
-```rust
-use anchor_lang::solana_program::system_instruction;
-```
-
-**CrystalBLEU similarity: 0.256** 
+**CrystalBLEU similarity: 0.148** 
 
 
 

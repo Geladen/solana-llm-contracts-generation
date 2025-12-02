@@ -1,4 +1,0 @@
-## Identified Hallucinations
-
-
-**CrystalBLEU similarity: ** 

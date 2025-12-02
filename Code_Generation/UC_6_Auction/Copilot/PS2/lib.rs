@@ -1,10 +1,13 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
+use anchor_lang::system_program::Transfer;
 
-declare_id!("7iub8X1kHopiHdaZm1DHSuMXtg1fvgxXFiaBcEEf9fGX");
+declare_id!("48hUQmvrqfSE9GmCXoV5mn84zhe9NALaiDEbDjTkLwdk");
+
+const MAX_OBJECT_LENGTH: usize = 64;
 
 #[program]
-pub mod auction_copilot {
+pub mod auction {
     use super::*;
 
     pub fn start(
@@ -13,157 +16,120 @@ pub mod auction_copilot {
         duration_slots: u64,
         starting_bid: u64,
     ) -> Result<()> {
-        // 1) compute end slot
+        let auction = &mut ctx.accounts.auction_info;
         let clock = Clock::get()?;
-        let end_slot = clock
+
+        require!(duration_slots > 0, ErrorCode::InvalidDuration);
+
+        auction.seller = *ctx.accounts.seller.key;
+        auction.highest_bidder = *ctx.accounts.seller.key; // sentinel until a real deposit arrives
+        auction.end_time = clock
             .slot
             .checked_add(duration_slots)
-            .ok_or(AuctionError::Overflow)?;
-
-        // 2) initialize on‐chain state
-        {
-            let info = &mut ctx.accounts.auction_info;
-            info.seller = *ctx.accounts.seller.key;
-            info.highest_bidder = *ctx.accounts.seller.key;
-            info.end_time = end_slot;
-            info.highest_bid = starting_bid;
-            info.object = auctioned_object.clone();
-        }
-
-        // 3) escrow the starting bid into the auction PDA
-        let cpi_accounts = system_program::Transfer {
-            from: ctx.accounts.seller.to_account_info(),
-            to: ctx.accounts.auction_info.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            cpi_accounts,
-        );
-        system_program::transfer(cpi_ctx, starting_bid)?;
+            .ok_or(ErrorCode::Overflow)?;
+        auction.highest_bid = starting_bid; // reflect starting bid in state (expected by tests)
+        auction.min_bid = starting_bid;     // keep min_bid for validation
+        auction.object = auctioned_object;
 
         Ok(())
     }
 
     pub fn bid(
         ctx: Context<BidCtx>,
-        _auctioned_object: String,
+        auctioned_object: String,
         amount_to_deposit: u64,
     ) -> Result<()> {
-        // 1) read current state (immutable)
-        let clock = Clock::get()?;
-        let end_time = ctx.accounts.auction_info.end_time;
-        require!(clock.slot < end_time, AuctionError::AuctionEnded);
+        // 1) take AccountInfos before mutably borrowing auction_info
+        let auction_info_ai = ctx.accounts.auction_info.to_account_info();
+        let system_program_ai = ctx.accounts.system_program.to_account_info();
+        let bidder_ai = ctx.accounts.bidder.to_account_info();
+        let prev_bidder_ai = ctx.accounts.current_highest_bidder.to_account_info();
 
-        let current_highest = ctx.accounts.auction_info.highest_bid;
+        // 2) mutably borrow the auction state
+        let auction = &mut ctx.accounts.auction_info;
+
+        // 3) validate auction active
+        let clock = Clock::get()?;
+        require!(clock.slot <= auction.end_time, ErrorCode::AuctionEnded);
+
+        // 4) validate deposit respects min_bid and improves highest_bid
         require!(
-            amount_to_deposit > current_highest,
-            AuctionError::BidTooLow
+            amount_to_deposit >= auction.min_bid,
+            ErrorCode::BidBelowMinimum
+        );
+        require!(
+            amount_to_deposit > auction.highest_bid,
+            ErrorCode::BidTooLow
         );
 
-        let prev_bidder = ctx.accounts.auction_info.highest_bidder;
-        let seller_key = ctx.accounts.auction_info.seller;
+        // 5) transfer lamports from bidder into PDA
+        system_program::transfer(
+            CpiContext::new(
+                system_program_ai.clone(),
+                Transfer {
+                    from: bidder_ai.clone(),
+                    to: auction_info_ai.clone(),
+                },
+            ),
+            amount_to_deposit,
+        )?;
 
-        // 2) deposit new bid via CPI
-        {
-            let cpi_accounts = system_program::Transfer {
-                from: ctx.accounts.bidder.to_account_info(),
-                to: ctx.accounts.auction_info.to_account_info(),
-            };
-            let cpi_ctx = CpiContext::new(
-                ctx.accounts.system_program.to_account_info(),
-                cpi_accounts,
-            );
-            system_program::transfer(cpi_ctx, amount_to_deposit)?;
+        // 6) refund previous highest bidder if they were a real bidder
+        let prev_amount = auction.highest_bid;
+        let prev_bidder_pk = auction.highest_bidder;
+        if prev_amount > 0 && prev_bidder_pk != auction.seller {
+            // adjust lamports directly: auction_info is mutable and owned by program,
+            // current_highest_bidder is a system account
+            **auction_info_ai.try_borrow_mut_lamports()? -= prev_amount;
+            **prev_bidder_ai.try_borrow_mut_lamports()? += prev_amount;
         }
 
-        // 3) refund previous bidder if they weren’t the seller
-        if prev_bidder != seller_key {
-            require_keys_eq!(
-                ctx.accounts.current_highest_bidder.key(),
-                prev_bidder,
-                AuctionError::InvalidHighestBidderAccount
-            );
-            let refund_amount = current_highest;
-
-            // debit the PDA’s lamports
-            {
-                let pda_ai = ctx.accounts.auction_info.to_account_info();
-                let mut lamports = pda_ai.lamports.borrow_mut();
-                **lamports = lamports
-                    .checked_sub(refund_amount)
-                    .ok_or(AuctionError::Overflow)?;
-            }
-
-            // credit back to previous bidder
-            {
-                let mut prior_lam =
-                    ctx.accounts.current_highest_bidder.lamports.borrow_mut();
-                **prior_lam = prior_lam.checked_add(refund_amount).unwrap();
-            }
-        }
-
-        // 4) finally update the highest bid & bidder (mutable borrow only here)
-        {
-            let info = &mut ctx.accounts.auction_info;
-            info.highest_bid = amount_to_deposit;
-            info.highest_bidder = *ctx.accounts.bidder.key;
-        }
+        // 7) update state
+        auction.highest_bid = amount_to_deposit;
+        auction.highest_bidder = *ctx.accounts.bidder.key;
 
         Ok(())
     }
 
-    pub fn end(ctx: Context<EndCtx>, _auctioned_object: String) -> Result<()> {
-        // 1) ensure auction time has passed
+    pub fn end(
+        ctx: Context<EndCtx>,
+        _auctioned_object: String,
+    ) -> Result<()> {
+        let auction = &ctx.accounts.auction_info;
+
+        // ensure auction finished
         let clock = Clock::get()?;
-        let end_time = ctx.accounts.auction_info.end_time;
         require!(
-            clock.slot >= end_time,
-            AuctionError::AuctionNotEnded
+            clock.slot >= auction.end_time,
+            ErrorCode::AuctionOngoing
         );
 
-        // 2) payout the winning bid via direct lamport math
-        let payout = ctx.accounts.auction_info.highest_bid;
-
-        // debit the PDA
-        {
-            let pda_ai = ctx.accounts.auction_info.to_account_info();
-            let mut lamports = pda_ai.lamports.borrow_mut();
-            **lamports = lamports
-                .checked_sub(payout)
-                .ok_or(AuctionError::Overflow)?;
-        }
-
-        // credit seller
-        {
-            let seller_ai = ctx.accounts.seller.to_account_info();
-            let mut sell_lam = seller_ai.lamports.borrow_mut();
-            **sell_lam = sell_lam.checked_add(payout).unwrap();
-        }
-
-        // 3) Anchor will close the auction_info account (close = seller),
-        //    returning its remaining rent‐exempt lamports to seller.
+        // No manual lamport math here. `close = seller` on the account
+        // will transfer the PDA's entire lamport balance (winning bid + rent)
+        // to the seller and deallocate the account.
         Ok(())
     }
 }
 
-//
-// ACCOUNT CONTEXTS
-//
-
 #[derive(Accounts)]
 #[instruction(auctioned_object: String)]
 pub struct StartCtx<'info> {
-    /// Seller signs to create and fund the auction
     #[account(mut)]
     pub seller: Signer<'info>,
 
-    /// PDA storing auction state and escrow
     #[account(
         init,
         payer = seller,
-        seeds = [auctioned_object.as_bytes()],
-        bump,
-        space = 8 + AuctionInfo::LEN
+        space = 8  // discriminator
+            + 32   // seller
+            + 32   // highest_bidder
+            + 8    // end_time
+            + 8    // highest_bid
+            + 8    // min_bid
+            + 4    // string prefix
+            + MAX_OBJECT_LENGTH,
+        seeds = [auctioned_object.as_ref()],
+        bump
     )]
     pub auction_info: Account<'info, AuctionInfo>,
 
@@ -173,21 +139,19 @@ pub struct StartCtx<'info> {
 #[derive(Accounts)]
 #[instruction(auctioned_object: String)]
 pub struct BidCtx<'info> {
-    /// Bidder signs and funds their bid
     #[account(mut)]
     pub bidder: Signer<'info>,
 
-    /// PDA storing auction state and lamports
     #[account(
         mut,
-        seeds = [auctioned_object.as_bytes()],
-        bump
+        seeds = [auctioned_object.as_ref()],
+        bump,
     )]
     pub auction_info: Account<'info, AuctionInfo>,
 
-    /// CHECK: must equal the prior highest bidder when refunding
-    #[account(mut)]
-    pub current_highest_bidder: AccountInfo<'info>,
+    /// CHECK: must equal auction_info.highest_bidder when used; mutable so we can credit lamports
+    #[account(mut, address = auction_info.highest_bidder)]
+    pub current_highest_bidder: SystemAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -195,26 +159,18 @@ pub struct BidCtx<'info> {
 #[derive(Accounts)]
 #[instruction(auctioned_object: String)]
 pub struct EndCtx<'info> {
-    /// Seller signs to end the auction and collect proceeds
     #[account(mut)]
     pub seller: Signer<'info>,
 
-    /// PDA storing auction state; closed here with `close = seller`
     #[account(
         mut,
-        seeds = [auctioned_object.as_bytes()],
+        seeds = [auctioned_object.as_ref()],
         bump,
         has_one = seller,
-        close = seller
+        close = seller,
     )]
     pub auction_info: Account<'info, AuctionInfo>,
-
-    pub system_program: Program<'info, System>,
 }
-
-//
-// STATE & ERRORS
-//
 
 #[account]
 pub struct AuctionInfo {
@@ -222,25 +178,23 @@ pub struct AuctionInfo {
     pub highest_bidder: Pubkey,
     pub end_time: u64,
     pub highest_bid: u64,
+    // additional stored field: minimum (starting) bid that is NOT deposited
+    pub min_bid: u64,
     pub object: String,
 }
 
-impl AuctionInfo {
-    pub const MAX_OBJECT_LEN: usize = 64;
-    pub const LEN: usize =
-        32 + 32 + 8 + 8 + 4 + Self::MAX_OBJECT_LEN;
-}
-
 #[error_code]
-pub enum AuctionError {
-    #[msg("Auction has already ended.")]
-    AuctionEnded,
-    #[msg("Auction has not ended yet.")]
-    AuctionNotEnded,
-    #[msg("Bid is too low.")]
-    BidTooLow,
-    #[msg("Arithmetic overflow.")]
+pub enum ErrorCode {
+    #[msg("Duration must be greater than zero")]
+    InvalidDuration,
+    #[msg("Overflow calculating end time")]
     Overflow,
-    #[msg("Invalid highest bidder account.")]
-    InvalidHighestBidderAccount,
+    #[msg("Auction has already ended")]
+    AuctionEnded,
+    #[msg("Bid must exceed the current highest bid")]
+    BidTooLow,
+    #[msg("Auction is still ongoing")]
+    AuctionOngoing,
+    #[msg("Bid is below minimum starting bid")]
+    BidBelowMinimum,
 }

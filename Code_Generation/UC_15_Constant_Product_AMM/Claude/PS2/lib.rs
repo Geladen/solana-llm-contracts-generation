@@ -1,14 +1,14 @@
 use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Mint, Transfer, SetAuthority};
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{self, Mint, SetAuthority, Token, TokenAccount, Transfer};
-use anchor_spl::token::spl_token;
 
-declare_id!("Brw1opJiqfMBEDN842G733c2zV6iMGe6BqAkVSpTcvrj");
+declare_id!("HN3gewTBjhgSUJ3HeGz2y1THC3N7aGYHCErfxrPtRabE");
 
 #[program]
 pub mod constant_product_amm {
     use super::*;
 
+    /// Initialize a new AMM pool for a token pair
     pub fn initialize(ctx: Context<InitializeCtx>) -> Result<()> {
         let amm_info = &mut ctx.accounts.amm_info;
         
@@ -19,157 +19,184 @@ pub mod constant_product_amm {
         amm_info.token_account1 = ctx.accounts.token_account1.key();
         amm_info.reserve0 = 0;
         amm_info.reserve1 = 0;
-        amm_info.ever_deposited = 0;
+        amm_info.ever_deposited = false;
         amm_info.supply = 0;
 
-        // Transfer ownership of token accounts to AMM PDA
-        let mint0_key = ctx.accounts.mint0.key();
-        let mint1_key = ctx.accounts.mint1.key();
-        let seeds = &[
-            b"amm",
-            mint0_key.as_ref(),
-            mint1_key.as_ref(),
-            &[ctx.bumps.amm_info],
-        ];
-        let signer_seeds = &[&seeds[..]];
-
-        // Set authority for token_account0
-        let cpi_accounts0 = SetAuthority {
+        // Transfer ownership of token_account0 to AMM PDA
+        let cpi_accounts = SetAuthority {
             account_or_mint: ctx.accounts.token_account0.to_account_info(),
             current_authority: ctx.accounts.initializer.to_account_info(),
         };
-        let cpi_ctx0 = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts0,
-        );
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         token::set_authority(
-            cpi_ctx0,
-            spl_token::instruction::AuthorityType::AccountOwner,
-            Some(ctx.accounts.amm_info.key()),
+            cpi_ctx,
+            anchor_spl::token::spl_token::instruction::AuthorityType::AccountOwner,
+            Some(amm_info.key()),
         )?;
 
-        // Set authority for token_account1
-        let cpi_accounts1 = SetAuthority {
+        // Transfer ownership of token_account1 to AMM PDA
+        let cpi_accounts = SetAuthority {
             account_or_mint: ctx.accounts.token_account1.to_account_info(),
             current_authority: ctx.accounts.initializer.to_account_info(),
         };
-        let cpi_ctx1 = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts1,
-        );
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         token::set_authority(
-            cpi_ctx1,
-            spl_token::instruction::AuthorityType::AccountOwner,
-            Some(ctx.accounts.amm_info.key()),
+            cpi_ctx,
+            anchor_spl::token::spl_token::instruction::AuthorityType::AccountOwner,
+            Some(amm_info.key()),
         )?;
 
+        msg!("AMM initialized for token pair");
         Ok(())
     }
 
+    /// Deposit liquidity into the AMM pool
     pub fn deposit(ctx: Context<DepositCtx>, amount0: u64, amount1: u64) -> Result<()> {
-        require!(amount0 > 0 && amount1 > 0, AmmError::InvalidAmount);
+        require!(amount0 > 0 && amount1 > 0, ErrorCode::InvalidAmount);
 
         let amm_info = &mut ctx.accounts.amm_info;
         let minted_pda = &mut ctx.accounts.minted_pda;
-
-        // Calculate liquidity tokens to mint BEFORE transfer
-        let liquidity: u64;
         
-        if amm_info.supply == 0 {
-            // First deposit: liquidity = sqrt(amount0 * amount1)
-            liquidity = (amount0 as u128)
+        let liquidity_minted: u64;
+
+        if !amm_info.ever_deposited {
+            // First deposit - use geometric mean minus minimum liquidity
+            // Calculate sqrt(amount0 * amount1)
+            let product = (amount0 as u128)
                 .checked_mul(amount1 as u128)
-                .ok_or(AmmError::MathOverflow)?
-                .integer_sqrt() as u64;
+                .ok_or(ErrorCode::MathOverflow)?;
             
-            require!(liquidity > 0, AmmError::InsufficientLiquidity);
+            require!(product > 0, ErrorCode::InsufficientLiquidity);
+            
+            // Integer square root using Newton's method
+            let mut z = product;
+            let mut y = (product + 1) / 2;
+            while y < z {
+                z = y;
+                y = (product / y + y) / 2;
+            }
+            
+            let sqrt_result = z as u64;
+            
+            // Minimum liquidity - permanently locked to prevent inflation attacks
+            // Set to 1 to support all deposit sizes while maintaining security
+            const MINIMUM_LIQUIDITY: u64 = 1;
+            
+            // For initial deposit, ensure minimum liquidity can be locked
+            require!(sqrt_result > MINIMUM_LIQUIDITY, ErrorCode::InsufficientLiquidity);
+            
+            // Subtract minimum liquidity 
+            liquidity_minted = sqrt_result - MINIMUM_LIQUIDITY;
+            
+            require!(liquidity_minted > 0, ErrorCode::InsufficientLiquidity);
+            
+            // Update total supply to include both minted liquidity and locked minimum
+            amm_info.supply = sqrt_result;
+            amm_info.ever_deposited = true;
         } else {
-            // Subsequent deposits: maintain current ratio
-            // Use u128 for intermediate calculations to avoid overflow
+            // Subsequent deposits - calculate liquidity proportionally
+            // Use minimum to prevent single-sided liquidity provision
             let liquidity0 = (amount0 as u128)
                 .checked_mul(amm_info.supply as u128)
-                .ok_or(AmmError::MathOverflow)?
+                .ok_or(ErrorCode::MathOverflow)?
                 .checked_div(amm_info.reserve0 as u128)
-                .ok_or(AmmError::DivisionByZero)?;
+                .ok_or(ErrorCode::DivisionByZero)? as u64;
             
             let liquidity1 = (amount1 as u128)
                 .checked_mul(amm_info.supply as u128)
-                .ok_or(AmmError::MathOverflow)?
+                .ok_or(ErrorCode::MathOverflow)?
                 .checked_div(amm_info.reserve1 as u128)
-                .ok_or(AmmError::DivisionByZero)?;
+                .ok_or(ErrorCode::DivisionByZero)? as u64;
             
-            // Take minimum to maintain ratio
-            liquidity = liquidity0.min(liquidity1) as u64;
-            require!(liquidity > 0, AmmError::InsufficientLiquidity);
+            liquidity_minted = std::cmp::min(liquidity0, liquidity1);
+            require!(liquidity_minted > 0, ErrorCode::InsufficientLiquidity);
+            
+            // Update total supply
+            amm_info.supply = amm_info.supply.checked_add(liquidity_minted)
+                .ok_or(ErrorCode::MathOverflow)?;
         }
 
-        // Transfer tokens from sender to AMM
-        let cpi_accounts0 = Transfer {
+        // Transfer token0 from sender to AMM
+        let cpi_accounts = Transfer {
             from: ctx.accounts.senders_token_account0.to_account_info(),
             to: ctx.accounts.pdas_token_account0.to_account_info(),
             authority: ctx.accounts.sender.to_account_info(),
         };
-        let cpi_ctx0 = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts0,
-        );
-        token::transfer(cpi_ctx0, amount0)?;
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        token::transfer(cpi_ctx, amount0)?;
 
-        let cpi_accounts1 = Transfer {
+        // Transfer token1 from sender to AMM
+        let cpi_accounts = Transfer {
             from: ctx.accounts.senders_token_account1.to_account_info(),
             to: ctx.accounts.pdas_token_account1.to_account_info(),
             authority: ctx.accounts.sender.to_account_info(),
         };
-        let cpi_ctx1 = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts1,
-        );
-        token::transfer(cpi_ctx1, amount1)?;
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        token::transfer(cpi_ctx, amount1)?;
 
-        // Reload token accounts to get actual balances
-        ctx.accounts.pdas_token_account0.reload()?;
-        ctx.accounts.pdas_token_account1.reload()?;
+        // Update reserves
+        amm_info.reserve0 = amm_info.reserve0.checked_add(amount0)
+            .ok_or(ErrorCode::MathOverflow)?;
+        amm_info.reserve1 = amm_info.reserve1.checked_add(amount1)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        // Update minted PDA - only track what user actually receives
+        minted_pda.minted = minted_pda.minted.checked_add(liquidity_minted)
+            .ok_or(ErrorCode::MathOverflow)?;
 
-        // Update reserves to match actual token account balances
-        amm_info.reserve0 = ctx.accounts.pdas_token_account0.amount;
-        amm_info.reserve1 = ctx.accounts.pdas_token_account1.amount;
-        amm_info.supply = amm_info.supply
-            .checked_add(liquidity)
-            .ok_or(AmmError::MathOverflow)?;
-        amm_info.ever_deposited = amm_info.ever_deposited
-            .checked_add(1)
-            .ok_or(AmmError::MathOverflow)?;
-
-        // Update user's minted liquidity
-        minted_pda.minted = minted_pda.minted
-            .checked_add(liquidity)
-            .ok_or(AmmError::MathOverflow)?;
-
+        msg!("Deposited {} token0 and {} token1, minted {} liquidity", amount0, amount1, liquidity_minted);
         Ok(())
     }
 
+    /// Redeem liquidity tokens for underlying assets
     pub fn redeem(ctx: Context<RedeemOrSwapCtx>, amount: u64) -> Result<()> {
-        require!(amount > 0, AmmError::InvalidAmount);
+        require!(amount > 0, ErrorCode::InvalidAmount);
 
-        require!(ctx.accounts.minted_pda.minted >= amount, AmmError::InsufficientLiquidity);
-        require!(ctx.accounts.amm_info.supply >= amount, AmmError::InsufficientLiquidity);
+        let amm_info = &mut ctx.accounts.amm_info;
+        
+        // Get minted_pda account info
+        let minted_pda_info = ctx.accounts.minted_pda.to_account_info();
+        
+        // Check if account has been initialized by checking owner and data
+        require!(
+            *minted_pda_info.owner == crate::ID,
+            ErrorCode::AccountNotInitialized
+        );
+        
+        let data = minted_pda_info.try_borrow_data()?;
+        require!(data.len() >= 16, ErrorCode::AccountNotInitialized);
+        
+        // Read minted value (bytes 8-16, after discriminator)
+        let minted = u64::from_le_bytes([
+            data[8], data[9], data[10], data[11],
+            data[12], data[13], data[14], data[15],
+        ]);
+        
+        drop(data);
 
-        // Calculate token amounts to return using u128 for precision
-        let amount0 = ((amount as u128)
-            .checked_mul(ctx.accounts.amm_info.reserve0 as u128)
-            .ok_or(AmmError::MathOverflow)?
-            .checked_div(ctx.accounts.amm_info.supply as u128)
-            .ok_or(AmmError::DivisionByZero)?) as u64;
+        require!(minted >= amount, ErrorCode::InsufficientLiquidity);
+        require!(amm_info.supply >= amount, ErrorCode::InsufficientLiquidity);
 
-        let amount1 = ((amount as u128)
-            .checked_mul(ctx.accounts.amm_info.reserve1 as u128)
-            .ok_or(AmmError::MathOverflow)?
-            .checked_div(ctx.accounts.amm_info.supply as u128)
-            .ok_or(AmmError::DivisionByZero)?) as u64;
+        // Calculate amounts to return
+        let amount0 = (amount as u128)
+            .checked_mul(amm_info.reserve0 as u128)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(amm_info.supply as u128)
+            .ok_or(ErrorCode::DivisionByZero)? as u64;
 
-        require!(amount0 > 0 && amount1 > 0, AmmError::InsufficientLiquidity);
+        let amount1 = (amount as u128)
+            .checked_mul(amm_info.reserve1 as u128)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(amm_info.supply as u128)
+            .ok_or(ErrorCode::DivisionByZero)? as u64;
 
-        // Prepare PDA signer
+        require!(amount0 > 0 && amount1 > 0, ErrorCode::InsufficientOutput);
+
+        // PDA signer seeds
         let mint0_key = ctx.accounts.mint0.key();
         let mint1_key = ctx.accounts.mint1.key();
         let seeds = &[
@@ -178,85 +205,90 @@ pub mod constant_product_amm {
             mint1_key.as_ref(),
             &[ctx.bumps.amm_info],
         ];
-        let signer_seeds = &[&seeds[..]];
+        let signer = &[&seeds[..]];
 
-        // Transfer tokens from AMM to sender
-        let cpi_accounts0 = Transfer {
+        // Transfer token0 from AMM to sender
+        let cpi_accounts = Transfer {
             from: ctx.accounts.pdas_token_account0.to_account_info(),
             to: ctx.accounts.senders_token_account0.to_account_info(),
-            authority: ctx.accounts.amm_info.to_account_info(),
+            authority: amm_info.to_account_info(),
         };
-        let cpi_ctx0 = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts0,
-            signer_seeds,
-        );
-        token::transfer(cpi_ctx0, amount0)?;
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        token::transfer(cpi_ctx, amount0)?;
 
-        let cpi_accounts1 = Transfer {
+        // Transfer token1 from AMM to sender
+        let cpi_accounts = Transfer {
             from: ctx.accounts.pdas_token_account1.to_account_info(),
             to: ctx.accounts.senders_token_account1.to_account_info(),
-            authority: ctx.accounts.amm_info.to_account_info(),
+            authority: amm_info.to_account_info(),
         };
-        let cpi_ctx1 = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts1,
-            signer_seeds,
-        );
-        token::transfer(cpi_ctx1, amount1)?;
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        token::transfer(cpi_ctx, amount1)?;
 
         // Update reserves and supply
-        let amm_info = &mut ctx.accounts.amm_info;
-        amm_info.reserve0 = amm_info.reserve0
-            .checked_sub(amount0)
-            .ok_or(AmmError::MathOverflow)?;
-        amm_info.reserve1 = amm_info.reserve1
-            .checked_sub(amount1)
-            .ok_or(AmmError::MathOverflow)?;
-        amm_info.supply = amm_info.supply
-            .checked_sub(amount)
-            .ok_or(AmmError::MathOverflow)?;
+        amm_info.reserve0 = amm_info.reserve0.checked_sub(amount0)
+            .ok_or(ErrorCode::MathOverflow)?;
+        amm_info.reserve1 = amm_info.reserve1.checked_sub(amount1)
+            .ok_or(ErrorCode::MathOverflow)?;
+        amm_info.supply = amm_info.supply.checked_sub(amount)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        // Update minted_pda
+        let new_minted = minted.checked_sub(amount)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        let mut data = minted_pda_info.try_borrow_mut_data()?;
+        let new_minted_bytes = new_minted.to_le_bytes();
+        data[8..16].copy_from_slice(&new_minted_bytes);
 
-        // Update user's minted liquidity
-        let minted_pda = &mut ctx.accounts.minted_pda;
-        minted_pda.minted = minted_pda.minted
-            .checked_sub(amount)
-            .ok_or(AmmError::MathOverflow)?;
-
+        msg!("Redeemed {} liquidity for {} token0 and {} token1", amount, amount0, amount1);
         Ok(())
     }
 
+    /// Swap tokens using constant product formula (x * y = k)
     pub fn swap(
         ctx: Context<RedeemOrSwapCtx>,
         is_mint0: bool,
         amount_in: u64,
         min_out_amount: u64,
     ) -> Result<()> {
-        require!(amount_in > 0, AmmError::InvalidAmount);
+        require!(amount_in > 0, ErrorCode::InvalidAmount);
 
-        // Calculate output amount using constant product formula
-        // x * y = k (constant)
-        // amount_out = (reserve_out * amount_in) / (reserve_in + amount_in)
+        let amm_info = &mut ctx.accounts.amm_info;
+
         let (reserve_in, reserve_out) = if is_mint0 {
-            (ctx.accounts.amm_info.reserve0, ctx.accounts.amm_info.reserve1)
+            (amm_info.reserve0, amm_info.reserve1)
         } else {
-            (ctx.accounts.amm_info.reserve1, ctx.accounts.amm_info.reserve0)
+            (amm_info.reserve1, amm_info.reserve0)
         };
 
-        let amount_out = ((reserve_out as u128)
-            .checked_mul(amount_in as u128)
-            .ok_or(AmmError::MathOverflow)?
-            .checked_div(
-                (reserve_in as u128)
-                    .checked_add(amount_in as u128)
-                    .ok_or(AmmError::MathOverflow)?
-            )
-            .ok_or(AmmError::DivisionByZero)?) as u64;
+        // Constant product formula: (x + dx) * (y - dy) = x * y
+        // With 0.3% fee: dy = (y * dx * 997) / (x * 1000 + dx * 997)
+        let amount_in_with_fee = (amount_in as u128)
+            .checked_mul(997)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        let numerator = amount_in_with_fee
+            .checked_mul(reserve_out as u128)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        let denominator = (reserve_in as u128)
+            .checked_mul(1000)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_add(amount_in_with_fee)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        let amount_out = numerator
+            .checked_div(denominator)
+            .ok_or(ErrorCode::DivisionByZero)? as u64;
 
-        require!(amount_out >= min_out_amount, AmmError::SlippageExceeded);
-        require!(amount_out > 0, AmmError::InsufficientOutputAmount);
+        require!(amount_out >= min_out_amount, ErrorCode::SlippageExceeded);
+        require!(amount_out > 0, ErrorCode::InsufficientOutput);
+        require!(amount_out < reserve_out, ErrorCode::InsufficientLiquidity);
 
-        // Prepare PDA signer
+        // PDA signer seeds
         let mint0_key = ctx.accounts.mint0.key();
         let mint1_key = ctx.accounts.mint1.key();
         let seeds = &[
@@ -265,85 +297,68 @@ pub mod constant_product_amm {
             mint1_key.as_ref(),
             &[ctx.bumps.amm_info],
         ];
-        let signer_seeds = &[&seeds[..]];
+        let signer = &[&seeds[..]];
 
         if is_mint0 {
-            // Swap mint0 for mint1
-            // Transfer mint0 from sender to AMM
-            let cpi_accounts_in = Transfer {
+            // Transfer token0 from sender to AMM
+            let cpi_accounts = Transfer {
                 from: ctx.accounts.senders_token_account0.to_account_info(),
                 to: ctx.accounts.pdas_token_account0.to_account_info(),
                 authority: ctx.accounts.sender.to_account_info(),
             };
-            let cpi_ctx_in = CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_in,
-            );
-            token::transfer(cpi_ctx_in, amount_in)?;
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+            token::transfer(cpi_ctx, amount_in)?;
 
-            // Transfer mint1 from AMM to sender
-            let cpi_accounts_out = Transfer {
+            // Transfer token1 from AMM to sender
+            let cpi_accounts = Transfer {
                 from: ctx.accounts.pdas_token_account1.to_account_info(),
                 to: ctx.accounts.senders_token_account1.to_account_info(),
-                authority: ctx.accounts.amm_info.to_account_info(),
+                authority: amm_info.to_account_info(),
             };
-            let cpi_ctx_out = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_out,
-                signer_seeds,
-            );
-            token::transfer(cpi_ctx_out, amount_out)?;
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+            token::transfer(cpi_ctx, amount_out)?;
 
             // Update reserves
-            let amm_info = &mut ctx.accounts.amm_info;
-            amm_info.reserve0 = amm_info.reserve0
-                .checked_add(amount_in)
-                .ok_or(AmmError::MathOverflow)?;
-            amm_info.reserve1 = amm_info.reserve1
-                .checked_sub(amount_out)
-                .ok_or(AmmError::MathOverflow)?;
+            amm_info.reserve0 = amm_info.reserve0.checked_add(amount_in)
+                .ok_or(ErrorCode::MathOverflow)?;
+            amm_info.reserve1 = amm_info.reserve1.checked_sub(amount_out)
+                .ok_or(ErrorCode::MathOverflow)?;
         } else {
-            // Swap mint1 for mint0
-            // Transfer mint1 from sender to AMM
-            let cpi_accounts_in = Transfer {
+            // Transfer token1 from sender to AMM
+            let cpi_accounts = Transfer {
                 from: ctx.accounts.senders_token_account1.to_account_info(),
                 to: ctx.accounts.pdas_token_account1.to_account_info(),
                 authority: ctx.accounts.sender.to_account_info(),
             };
-            let cpi_ctx_in = CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_in,
-            );
-            token::transfer(cpi_ctx_in, amount_in)?;
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+            token::transfer(cpi_ctx, amount_in)?;
 
-            // Transfer mint0 from AMM to sender
-            let cpi_accounts_out = Transfer {
+            // Transfer token0 from AMM to sender
+            let cpi_accounts = Transfer {
                 from: ctx.accounts.pdas_token_account0.to_account_info(),
                 to: ctx.accounts.senders_token_account0.to_account_info(),
-                authority: ctx.accounts.amm_info.to_account_info(),
+                authority: amm_info.to_account_info(),
             };
-            let cpi_ctx_out = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_out,
-                signer_seeds,
-            );
-            token::transfer(cpi_ctx_out, amount_out)?;
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+            token::transfer(cpi_ctx, amount_out)?;
 
             // Update reserves
-            let amm_info = &mut ctx.accounts.amm_info;
-            amm_info.reserve1 = amm_info.reserve1
-                .checked_add(amount_in)
-                .ok_or(AmmError::MathOverflow)?;
-            amm_info.reserve0 = amm_info.reserve0
-                .checked_sub(amount_out)
-                .ok_or(AmmError::MathOverflow)?;
+            amm_info.reserve1 = amm_info.reserve1.checked_add(amount_in)
+                .ok_or(ErrorCode::MathOverflow)?;
+            amm_info.reserve0 = amm_info.reserve0.checked_sub(amount_out)
+                .ok_or(ErrorCode::MathOverflow)?;
         }
 
+        msg!("Swapped {} in for {} out", amount_in, amount_out);
         Ok(())
     }
 }
 
-// Context Structures
+// Account Contexts
 
 #[derive(Accounts)]
 pub struct InitializeCtx<'info> {
@@ -364,15 +379,15 @@ pub struct InitializeCtx<'info> {
 
     #[account(
         mut,
-        token::mint = mint0,
-        token::authority = initializer
+        constraint = token_account0.mint == mint0.key(),
+        constraint = token_account0.owner == initializer.key()
     )]
     pub token_account0: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        token::mint = mint1,
-        token::authority = initializer
+        constraint = token_account1.mint == mint1.key(),
+        constraint = token_account1.owner == initializer.key()
     )]
     pub token_account1: Account<'info, TokenAccount>,
 
@@ -399,39 +414,37 @@ pub struct DepositCtx<'info> {
     #[account(
         init_if_needed,
         payer = sender,
-        space = 8 + MintedPDA::INIT_SPACE,
+        space = 8 + MintedPda::INIT_SPACE,
         seeds = [b"minted", sender.key().as_ref()],
         bump
     )]
-    pub minted_pda: Account<'info, MintedPDA>,
+    pub minted_pda: Account<'info, MintedPda>,
 
     #[account(
         mut,
-        token::mint = mint0,
-        token::authority = sender
+        associated_token::mint = mint0,
+        associated_token::authority = sender
     )]
     pub senders_token_account0: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        token::mint = mint1,
-        token::authority = sender
+        associated_token::mint = mint1,
+        associated_token::authority = sender
     )]
     pub senders_token_account1: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        constraint = pdas_token_account0.key() == amm_info.token_account0 @ AmmError::InvalidTokenAccount,
-        token::mint = mint0,
-        token::authority = amm_info
+        constraint = pdas_token_account0.key() == amm_info.token_account0,
+        constraint = pdas_token_account0.mint == mint0.key()
     )]
     pub pdas_token_account0: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        constraint = pdas_token_account1.key() == amm_info.token_account1 @ AmmError::InvalidTokenAccount,
-        token::mint = mint1,
-        token::authority = amm_info
+        constraint = pdas_token_account1.key() == amm_info.token_account1,
+        constraint = pdas_token_account1.mint == mint1.key()
     )]
     pub pdas_token_account1: Account<'info, TokenAccount>,
 
@@ -455,40 +468,39 @@ pub struct RedeemOrSwapCtx<'info> {
     )]
     pub amm_info: Account<'info, AmmInfo>,
 
+    /// CHECK: This account is optional - only used for redeem, not for swap
     #[account(
         mut,
         seeds = [b"minted", sender.key().as_ref()],
         bump
     )]
-    pub minted_pda: Account<'info, MintedPDA>,
+    pub minted_pda: UncheckedAccount<'info>,
 
     #[account(
         mut,
-        token::mint = mint0,
-        token::authority = sender
+        associated_token::mint = mint0,
+        associated_token::authority = sender
     )]
     pub senders_token_account0: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        token::mint = mint1,
-        token::authority = sender
+        associated_token::mint = mint1,
+        associated_token::authority = sender
     )]
     pub senders_token_account1: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        constraint = pdas_token_account0.key() == amm_info.token_account0 @ AmmError::InvalidTokenAccount,
-        token::mint = mint0,
-        token::authority = amm_info
+        constraint = pdas_token_account0.key() == amm_info.token_account0,
+        constraint = pdas_token_account0.mint == mint0.key()
     )]
     pub pdas_token_account0: Account<'info, TokenAccount>,
 
     #[account(
         mut,
-        constraint = pdas_token_account1.key() == amm_info.token_account1 @ AmmError::InvalidTokenAccount,
-        token::mint = mint1,
-        token::authority = amm_info
+        constraint = pdas_token_account1.key() == amm_info.token_account1,
+        constraint = pdas_token_account1.mint == mint1.key()
     )]
     pub pdas_token_account1: Account<'info, TokenAccount>,
 
@@ -508,55 +520,34 @@ pub struct AmmInfo {
     pub token_account1: Pubkey,
     pub reserve0: u64,
     pub reserve1: u64,
-    pub ever_deposited: u64,
+    pub ever_deposited: bool,
     pub supply: u64,
 }
 
 #[account]
 #[derive(InitSpace)]
-pub struct MintedPDA {
+pub struct MintedPda {
     pub minted: u64,
 }
 
 // Error Codes
 
 #[error_code]
-pub enum AmmError {
+pub enum ErrorCode {
     #[msg("Invalid amount provided")]
     InvalidAmount,
-    #[msg("Insufficient liquidity")]
-    InsufficientLiquidity,
     #[msg("Math overflow")]
     MathOverflow,
     #[msg("Division by zero")]
     DivisionByZero,
+    #[msg("Insufficient liquidity")]
+    InsufficientLiquidity,
+    #[msg("Insufficient output amount")]
+    InsufficientOutput,
     #[msg("Slippage tolerance exceeded")]
     SlippageExceeded,
-    #[msg("Insufficient output amount")]
-    InsufficientOutputAmount,
-    #[msg("Invalid token account")]
-    InvalidTokenAccount,
-}
-
-// Helper trait for integer square root
-trait IntegerSqrt {
-    fn integer_sqrt(self) -> Self;
-}
-
-impl IntegerSqrt for u128 {
-    fn integer_sqrt(self) -> Self {
-        if self < 2 {
-            return self;
-        }
-        
-        let mut x = self;
-        let mut y = (x + 1) / 2;
-        
-        while y < x {
-            x = y;
-            y = (x + self / x) / 2;
-        }
-        
-        x
-    }
+    #[msg("Invalid account")]
+    InvalidAccount,
+    #[msg("Account not initialized")]
+    AccountNotInitialized,
 }

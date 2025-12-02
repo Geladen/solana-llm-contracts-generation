@@ -1,23 +1,18 @@
 use anchor_lang::prelude::*;
 
-declare_id!("5W5qJAay3CcokJDv31h4YrhQtHUFYituLtjwiZwDtTUb");
+declare_id!("5HW9RUa4vgexN3MqCG5aNYCwWBwAy8ut6UFjPZfiAHZz");
 
 #[program]
 pub mod escrow {
     use super::*;
 
-    /// Initialize the escrow contract
-    /// Must be called by the seller with the amount and escrow name
     pub fn initialize(
-        ctx: Context<InitializeCtx>, 
-        amount_in_lamports: u64, 
-        escrow_name: String
+        ctx: Context<InitializeCtx>,
+        amount_in_lamports: u64,
+        _escrow_name: String,
     ) -> Result<()> {
         // Validate amount is not zero
-        require!(amount_in_lamports > 0, EscrowError::InvalidAmount);
-        
-        // Validate escrow name length to prevent excessive storage costs
-        require!(escrow_name.len() <= 50, EscrowError::EscrowNameTooLong);
+        require!(amount_in_lamports > 0, EscrowError::ZeroAmount);
 
         let escrow_info = &mut ctx.accounts.escrow_info;
         
@@ -27,161 +22,159 @@ pub mod escrow {
         escrow_info.amount_in_lamports = amount_in_lamports;
         escrow_info.state = State::WaitDeposit;
 
-        msg!("Escrow initialized: {} lamports between {} and {}", 
-             amount_in_lamports, 
-             ctx.accounts.seller.key(), 
+        msg!("Escrow initialized: {} lamports between seller {} and buyer {}",
+             amount_in_lamports,
+             ctx.accounts.seller.key(),
              ctx.accounts.buyer.key());
 
         Ok(())
     }
 
-    /// Deposit funds into escrow
-    /// Must be called by the buyer to deposit the exact amount
     pub fn deposit(ctx: Context<DepositCtx>, _escrow_name: String) -> Result<()> {
+        // Store all needed values before any mutable borrows
+        let amount_to_transfer = ctx.accounts.escrow_info.amount_in_lamports;
+        let buyer_key = ctx.accounts.escrow_info.buyer;
+        let current_state = ctx.accounts.escrow_info.state.clone();
+
         // Validate state
         require!(
-            ctx.accounts.escrow_info.state == State::WaitDeposit, 
+            current_state == State::WaitDeposit,
             EscrowError::InvalidState
         );
 
         // Validate buyer matches
         require!(
-            ctx.accounts.escrow_info.buyer == ctx.accounts.buyer.key(), 
+            ctx.accounts.buyer.key() == buyer_key,
             EscrowError::UnauthorizedBuyer
         );
-
-        // Validate seller matches for additional security
-        require!(
-            ctx.accounts.escrow_info.seller == ctx.accounts.seller.key(), 
-            EscrowError::UnauthorizedSeller
-        );
-
-        let amount = ctx.accounts.escrow_info.amount_in_lamports;
-        let buyer_key = ctx.accounts.buyer.key();
-        let escrow_key = ctx.accounts.escrow_info.key();
 
         // Transfer lamports from buyer to escrow PDA
-        let ix = anchor_lang::solana_program::system_instruction::transfer(
-            &buyer_key,
-            &escrow_key,
-            amount,
+        let transfer_instruction = anchor_lang::system_program::Transfer {
+            from: ctx.accounts.buyer.to_account_info(),
+            to: ctx.accounts.escrow_info.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            transfer_instruction,
         );
 
-        anchor_lang::solana_program::program::invoke(
-            &ix,
-            &[
-                ctx.accounts.buyer.to_account_info(),
-                ctx.accounts.escrow_info.to_account_info(),
-            ],
-        )?;
+        anchor_lang::system_program::transfer(cpi_ctx, amount_to_transfer)?;
 
-        // Update state - now we can borrow mutably
-        ctx.accounts.escrow_info.state = State::WaitRecipient;
+        // Now safely update state with mutable borrow
+        let escrow_info = &mut ctx.accounts.escrow_info;
+        escrow_info.state = State::WaitRecipient;
 
-        msg!("Buyer deposited {} lamports into escrow", amount);
+        msg!("Buyer deposited {} lamports to escrow", amount_to_transfer);
 
         Ok(())
     }
 
-    /// Pay the seller
-    /// Must be called by the buyer to release funds to seller
     pub fn pay(ctx: Context<PayCtx>, _escrow_name: String) -> Result<()> {
+        // Get needed data before any mutable operations
+        let buyer_key = ctx.accounts.escrow_info.buyer;
+        let current_state = ctx.accounts.escrow_info.state.clone();
+
         // Validate state
         require!(
-            ctx.accounts.escrow_info.state == State::WaitRecipient, 
+            current_state == State::WaitRecipient,
             EscrowError::InvalidState
         );
 
-        // Validate buyer authorization
+        // Validate buyer
         require!(
-            ctx.accounts.escrow_info.buyer == ctx.accounts.buyer.key(), 
+            ctx.accounts.buyer.key() == buyer_key,
             EscrowError::UnauthorizedBuyer
         );
 
-        // Validate seller matches
-        require!(
-            ctx.accounts.escrow_info.seller == ctx.accounts.seller.key(), 
-            EscrowError::UnauthorizedSeller
-        );
+        // Get escrow account balance - transfer everything to seller
+        let escrow_account_info = ctx.accounts.escrow_info.to_account_info();
+        let escrow_balance = escrow_account_info.lamports();
 
-        // Get escrow balance before any mutable operations
-        let escrow_balance = ctx.accounts.escrow_info.to_account_info().lamports();
-        
-        // Transfer all lamports from escrow PDA to seller
-        **ctx.accounts.escrow_info.to_account_info().try_borrow_mut_lamports()? -= escrow_balance;
-        **ctx.accounts.seller.to_account_info().try_borrow_mut_lamports()? += escrow_balance;
-
-        // Update state to closed
-        ctx.accounts.escrow_info.state = State::Closed;
-
-        msg!("Payment of {} lamports sent to seller", escrow_balance);
-
-        Ok(())
-    }
-
-    /// Refund the buyer
-    /// Must be called by the seller to return funds to buyer
-    pub fn refund(ctx: Context<RefundCtx>, _escrow_name: String) -> Result<()> {
-        // Validate state
-        require!(
-            ctx.accounts.escrow_info.state == State::WaitRecipient, 
-            EscrowError::InvalidState
-        );
-
-        // Validate seller authorization
-        require!(
-            ctx.accounts.escrow_info.seller == ctx.accounts.seller.key(), 
-            EscrowError::UnauthorizedSeller
-        );
-
-        // Validate buyer matches
-        require!(
-            ctx.accounts.escrow_info.buyer == ctx.accounts.buyer.key(), 
-            EscrowError::UnauthorizedBuyer
-        );
-
-        let deposited_amount = ctx.accounts.escrow_info.amount_in_lamports;
-        // Get escrow balance before any mutable operations
-        let escrow_balance = ctx.accounts.escrow_info.to_account_info().lamports();
-        
-        // Calculate rent exempt amount (approximate PDA account rent)
-        let rent_lamports = escrow_balance - deposited_amount;
-
-        // Transfer deposited amount back to buyer
-        **ctx.accounts.escrow_info.to_account_info().try_borrow_mut_lamports()? -= deposited_amount;
-        **ctx.accounts.buyer.to_account_info().try_borrow_mut_lamports()? += deposited_amount;
-
-        // Transfer remaining rent lamports to seller
-        if rent_lamports > 0 {
-            **ctx.accounts.escrow_info.to_account_info().try_borrow_mut_lamports()? -= rent_lamports;
-            **ctx.accounts.seller.to_account_info().try_borrow_mut_lamports()? += rent_lamports;
+        // Transfer all funds from escrow PDA to seller (closing the account)
+        {
+            let seller_account_info = ctx.accounts.seller.to_account_info();
+            let mut escrow_lamports = escrow_account_info.try_borrow_mut_lamports()?;
+            let mut seller_lamports = seller_account_info.try_borrow_mut_lamports()?;
+            **seller_lamports += escrow_balance;
+            **escrow_lamports = 0;
         }
 
-        // Update state to closed
-        ctx.accounts.escrow_info.state = State::Closed;
+        // Now update state after lamport operations complete
+        let escrow_info = &mut ctx.accounts.escrow_info;
+        escrow_info.state = State::Closed;
 
-        msg!("Refunded {} lamports to buyer, {} lamports rent to seller", 
-             deposited_amount, rent_lamports);
+        msg!("Payment of {} lamports transferred to seller", escrow_balance);
+
+        Ok(())
+    }
+
+    pub fn refund(ctx: Context<RefundCtx>, _escrow_name: String) -> Result<()> {
+        // Get needed data before any mutable operations
+        let seller_key = ctx.accounts.escrow_info.seller;
+        let current_state = ctx.accounts.escrow_info.state.clone();
+        let refund_amount = ctx.accounts.escrow_info.amount_in_lamports;
+
+        // Validate state
+        require!(
+            current_state == State::WaitRecipient,
+            EscrowError::InvalidState
+        );
+
+        // Validate seller
+        require!(
+            ctx.accounts.seller.key() == seller_key,
+            EscrowError::UnauthorizedSeller
+        );
+        
+        // Get account info and calculate remaining balance
+        let escrow_account_info = ctx.accounts.escrow_info.to_account_info();
+        let buyer_account_info = ctx.accounts.buyer.to_account_info();
+        let seller_account_info = ctx.accounts.seller.to_account_info();
+        let escrow_balance = escrow_account_info.lamports();
+        let remaining_balance = escrow_balance - refund_amount;
+        
+        // Perform all transfers - refund to buyer, rent to seller, close escrow
+        {
+            let mut escrow_lamports = escrow_account_info.try_borrow_mut_lamports()?;
+            let mut buyer_lamports = buyer_account_info.try_borrow_mut_lamports()?;
+            let mut seller_lamports = seller_account_info.try_borrow_mut_lamports()?;
+            
+            // Transfer deposited amount to buyer
+            **buyer_lamports += refund_amount;
+            
+            // Transfer remaining balance (rent) to seller
+            **seller_lamports += remaining_balance;
+            
+            // Close escrow account
+            **escrow_lamports = 0;
+        }
+
+        // Now update state after all lamport operations complete
+        let escrow_info = &mut ctx.accounts.escrow_info;
+        escrow_info.state = State::Closed;
+
+        msg!("Refunded {} lamports to buyer and {} lamports rent to seller", 
+             refund_amount, remaining_balance);
 
         Ok(())
     }
 }
 
-// Context structs for each instruction
-
+// Context Structures
 #[derive(Accounts)]
 #[instruction(amount_in_lamports: u64, escrow_name: String)]
 pub struct InitializeCtx<'info> {
     #[account(mut)]
     pub seller: Signer<'info>,
     
-    /// CHECK: buyer account for PDA derivation
+    /// CHECK: Used only for PDA derivation, not modified in this instruction
     pub buyer: AccountInfo<'info>,
     
     #[account(
         init,
         payer = seller,
-        space = EscrowInfo::LEN,
+        space = 8 + EscrowInfo::LEN,
         seeds = [escrow_name.as_ref(), seller.key().as_ref(), buyer.key().as_ref()],
         bump
     )]
@@ -196,13 +189,14 @@ pub struct DepositCtx<'info> {
     #[account(mut)]
     pub buyer: Signer<'info>,
     
-    /// CHECK: seller account for validation
+    /// CHECK: Used for validation against escrow_info.seller
     pub seller: AccountInfo<'info>,
     
     #[account(
         mut,
         seeds = [escrow_name.as_ref(), seller.key().as_ref(), buyer.key().as_ref()],
-        bump
+        bump,
+        constraint = escrow_info.seller == seller.key() @ EscrowError::InvalidSeller
     )]
     pub escrow_info: Account<'info, EscrowInfo>,
     
@@ -214,14 +208,15 @@ pub struct DepositCtx<'info> {
 pub struct PayCtx<'info> {
     pub buyer: Signer<'info>,
     
+    /// CHECK: Validated against escrow_info.seller, receives payment
     #[account(mut)]
-    /// CHECK: seller account to receive funds
     pub seller: AccountInfo<'info>,
     
     #[account(
         mut,
         seeds = [escrow_name.as_ref(), seller.key().as_ref(), buyer.key().as_ref()],
-        bump
+        bump,
+        constraint = escrow_info.seller == seller.key() @ EscrowError::InvalidSeller
     )]
     pub escrow_info: Account<'info, EscrowInfo>,
 }
@@ -232,20 +227,21 @@ pub struct RefundCtx<'info> {
     #[account(mut)]
     pub seller: Signer<'info>,
     
+    /// CHECK: Validated against escrow_info.buyer, receives refund
     #[account(mut)]
-    /// CHECK: buyer account to receive refund
     pub buyer: AccountInfo<'info>,
     
     #[account(
         mut,
         seeds = [escrow_name.as_ref(), seller.key().as_ref(), buyer.key().as_ref()],
-        bump
+        bump,
+        constraint = escrow_info.seller == seller.key() @ EscrowError::InvalidSeller,
+        constraint = escrow_info.buyer == buyer.key() @ EscrowError::InvalidBuyer
     )]
     pub escrow_info: Account<'info, EscrowInfo>,
 }
 
-// Account data structure
-
+// Account Structure
 #[account]
 pub struct EscrowInfo {
     pub seller: Pubkey,
@@ -255,34 +251,30 @@ pub struct EscrowInfo {
 }
 
 impl EscrowInfo {
-    pub const LEN: usize = 8 + 32 + 32 + 8 + 1; // discriminator + seller + buyer + amount + state
+    pub const LEN: usize = 32 + 32 + 8 + 1; // seller + buyer + amount + state
 }
 
-// State enum
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq)]
+// State Enum
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
 pub enum State {
     WaitDeposit,
     WaitRecipient,
     Closed,
 }
 
-// Custom error types
-
+// Error Types
 #[error_code]
 pub enum EscrowError {
-    #[msg("Invalid amount: must be greater than zero")]
-    InvalidAmount,
-    
-    #[msg("Invalid state for this operation")]
+    #[msg("Amount cannot be zero")]
+    ZeroAmount,
+    #[msg("Invalid escrow state for this operation")]
     InvalidState,
-    
     #[msg("Unauthorized buyer")]
     UnauthorizedBuyer,
-    
     #[msg("Unauthorized seller")]
     UnauthorizedSeller,
-    
-    #[msg("Escrow name too long")]
-    EscrowNameTooLong,
+    #[msg("Invalid seller in escrow")]
+    InvalidSeller,
+    #[msg("Invalid buyer in escrow")]
+    InvalidBuyer,
 }

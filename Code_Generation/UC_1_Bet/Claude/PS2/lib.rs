@@ -1,148 +1,160 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 
-declare_id!("FW179MQnyxoKnoehwAqj3mpQhS7SSyyVujGstx3BQNMd");
+declare_id!("68DBMjPpJVtsPdG1zaLbveAyZC4F16e4QGmpM5J5ynyD");
 
 #[program]
-pub mod betting_program {
+pub mod betting_contract {
     use super::*;
 
     pub fn join(ctx: Context<JoinCtx>, delay: u64, wager: u64) -> Result<()> {
-        let bet_info = &mut ctx.accounts.bet_info;
-        let participant1 = &ctx.accounts.participant1;
-        let participant2 = &ctx.accounts.participant2;
-        let oracle = &ctx.accounts.oracle;
         let clock = Clock::get()?;
-
+        
         // Validate wager amount
         require!(wager > 0, BettingError::InvalidWager);
 
-        // Initialize bet info
-        bet_info.participant1 = participant1.key();
-        bet_info.participant2 = participant2.key();
-        bet_info.oracle = oracle.key();
-        bet_info.deadline = clock.slot + delay;
+        // Store keys for later use
+        let participant1_key = ctx.accounts.participant1.key();
+        let participant2_key = ctx.accounts.participant2.key();
+        let oracle_key = ctx.accounts.oracle.key();
+        let bet_key = ctx.accounts.bet_info.key();
+        let deadline = clock.slot + delay;
+        let pot = wager * 2;
+        
+        // Transfer wager from participant1 to PDA
+        let transfer_ix1 = system_program::Transfer {
+            from: ctx.accounts.participant1.to_account_info(),
+            to: ctx.accounts.bet_info.to_account_info(),
+        };
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                transfer_ix1,
+            ),
+            wager,
+        )?;
+
+        // Transfer wager from participant2 to PDA
+        let transfer_ix2 = system_program::Transfer {
+            from: ctx.accounts.participant2.to_account_info(),
+            to: ctx.accounts.bet_info.to_account_info(),
+        };
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                transfer_ix2,
+            ),
+            wager,
+        )?;
+
+        // Initialize bet info after transfers
+        let bet_info = &mut ctx.accounts.bet_info;
+        bet_info.participant1 = participant1_key;
+        bet_info.participant2 = participant2_key;
+        bet_info.oracle = oracle_key;
         bet_info.wager = wager;
-        bet_info.total_pot = wager * 2;
+        bet_info.deadline = deadline;
+        bet_info.pot = pot;
         bet_info.is_active = true;
 
-        // Transfer wager from participant1 to bet_info PDA
-        let cpi_context = CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            system_program::Transfer {
-                from: participant1.to_account_info(),
-                to: bet_info.to_account_info(),
-            },
-        );
-        system_program::transfer(cpi_context, wager)?;
+        emit!(BetCreated {
+            bet_id: bet_key,
+            participant1: participant1_key,
+            participant2: participant2_key,
+            oracle: oracle_key,
+            wager,
+            deadline,
+            pot,
+        });
 
-        // Transfer wager from participant2 to bet_info PDA
-        let cpi_context = CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            system_program::Transfer {
-                from: participant2.to_account_info(),
-                to: bet_info.to_account_info(),
-            },
-        );
-        system_program::transfer(cpi_context, wager)?;
-
-        msg!("Bet initialized with deadline: {}, wager: {}", bet_info.deadline, wager);
         Ok(())
     }
 
     pub fn win(ctx: Context<WinCtx>) -> Result<()> {
-        let bet_info = &mut ctx.accounts.bet_info;
-        let oracle = &ctx.accounts.oracle;
-        let winner = &ctx.accounts.winner;
-        let participant1 = &ctx.accounts.participant1;
-        let participant2 = &ctx.accounts.participant2;
+        let clock = Clock::get()?;
 
-        // Validate oracle signature
-        require!(oracle.key() == bet_info.oracle, BettingError::InvalidOracle);
-        
+        // Store values before borrowing mutably
+        let bet_key = ctx.accounts.bet_info.key();
+        let is_active = ctx.accounts.bet_info.is_active;
+        let deadline = ctx.accounts.bet_info.deadline;
+        let oracle_key = ctx.accounts.bet_info.oracle;
+        let participant1_key = ctx.accounts.bet_info.participant1;
+        let participant2_key = ctx.accounts.bet_info.participant2;
+        let pot_amount = ctx.accounts.bet_info.pot;
+        let winner_key = ctx.accounts.winner.key();
+
         // Validate bet is still active
-        require!(bet_info.is_active, BettingError::BetNotActive);
+        require!(is_active, BettingError::BetNotActive);
+        
+        // Validate deadline hasn't passed
+        require!(clock.slot <= deadline, BettingError::BetExpired);
+        
+        // Validate oracle is calling this function
+        require!(
+            ctx.accounts.oracle.key() == oracle_key,
+            BettingError::UnauthorizedOracle
+        );
 
         // Validate winner is one of the participants
         require!(
-            winner.key() == bet_info.participant1 || winner.key() == bet_info.participant2,
+            winner_key == participant1_key || winner_key == participant2_key,
             BettingError::InvalidWinner
         );
 
-        // Check deadline hasn't passed
-        let clock = Clock::get()?;
-        require!(clock.slot < bet_info.deadline, BettingError::DeadlinePassed);
-
-        let total_pot = bet_info.total_pot;
-
-        // Generate PDA seeds for signing
-        let participant1_key = participant1.key();
-        let participant2_key = participant2.key();
-        let seeds = &[
-            participant1_key.as_ref(),
-            participant2_key.as_ref(),
-        ];
-        let (pda, bump) = Pubkey::find_program_address(seeds, ctx.program_id);
-        require!(pda == bet_info.key(), BettingError::InvalidPDA);
-
-        let signer_seeds = &[
-            participant1_key.as_ref(),
-            participant2_key.as_ref(),
-            &[bump],
-        ];
-
         // Transfer entire pot to winner
-        **bet_info.to_account_info().try_borrow_mut_lamports()? -= total_pot;
-        **winner.to_account_info().try_borrow_mut_lamports()? += total_pot;
+        **ctx.accounts.bet_info.to_account_info().try_borrow_mut_lamports()? -= pot_amount;
+        **ctx.accounts.winner.to_account_info().try_borrow_mut_lamports()? += pot_amount;
 
         // Mark bet as inactive
+        let bet_info = &mut ctx.accounts.bet_info;
         bet_info.is_active = false;
+        bet_info.winner = Some(winner_key);
 
-        msg!("Winner {} received {} lamports", winner.key(), total_pot);
+        emit!(BetWon {
+            bet_id: bet_key,
+            winner: winner_key,
+            pot: pot_amount,
+        });
+
         Ok(())
     }
 
     pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
-        let bet_info = &mut ctx.accounts.bet_info;
-        let participant1 = &ctx.accounts.participant1;
-        let participant2 = &ctx.accounts.participant2;
         let clock = Clock::get()?;
 
+        // Store values before borrowing mutably
+        let bet_key = ctx.accounts.bet_info.key();
+        let is_active = ctx.accounts.bet_info.is_active;
+        let deadline = ctx.accounts.bet_info.deadline;
+        let wager_amount = ctx.accounts.bet_info.wager;
+        let participant1_key = ctx.accounts.bet_info.participant1;
+        let participant2_key = ctx.accounts.bet_info.participant2;
+
         // Validate bet is still active
-        require!(bet_info.is_active, BettingError::BetNotActive);
+        require!(is_active, BettingError::BetNotActive);
+        
+        // Validate deadline has passed
+        require!(clock.slot > deadline, BettingError::BetNotExpired);
 
-        // Check deadline has passed
-        require!(clock.slot >= bet_info.deadline, BettingError::DeadlineNotPassed);
+        // Return wager to participant1
+        **ctx.accounts.bet_info.to_account_info().try_borrow_mut_lamports()? -= wager_amount;
+        **ctx.accounts.participant1.to_account_info().try_borrow_mut_lamports()? += wager_amount;
 
-        let wager = bet_info.wager;
-
-        // Generate PDA seeds for signing
-        let participant1_key = participant1.key();
-        let participant2_key = participant2.key();
-        let seeds = &[
-            participant1_key.as_ref(),
-            participant2_key.as_ref(),
-        ];
-        let (pda, bump) = Pubkey::find_program_address(seeds, ctx.program_id);
-        require!(pda == bet_info.key(), BettingError::InvalidPDA);
-
-        let signer_seeds = &[
-            participant1_key.as_ref(),
-            participant2_key.as_ref(),
-            &[bump],
-        ];
-
-        // Return original wagers to participants
-        **bet_info.to_account_info().try_borrow_mut_lamports()? -= wager;
-        **participant1.to_account_info().try_borrow_mut_lamports()? += wager;
-
-        **bet_info.to_account_info().try_borrow_mut_lamports()? -= wager;
-        **participant2.to_account_info().try_borrow_mut_lamports()? += wager;
+        // Return wager to participant2
+        **ctx.accounts.bet_info.to_account_info().try_borrow_mut_lamports()? -= wager_amount;
+        **ctx.accounts.participant2.to_account_info().try_borrow_mut_lamports()? += wager_amount;
 
         // Mark bet as inactive
+        let bet_info = &mut ctx.accounts.bet_info;
         bet_info.is_active = false;
 
-        msg!("Timeout: Returned {} lamports to each participant", wager);
+        emit!(BetTimedOut {
+            bet_id: bet_key,
+            participant1: participant1_key,
+            participant2: participant2_key,
+            refunded_amount: wager_amount,
+        });
+
         Ok(())
     }
 }
@@ -155,13 +167,13 @@ pub struct JoinCtx<'info> {
     #[account(mut)]
     pub participant2: Signer<'info>,
     
-    /// CHECK: Oracle address is stored for later validation
-    pub oracle: AccountInfo<'info>,
+    /// CHECK: Oracle address is stored for reference, not used as signer here
+    pub oracle: UncheckedAccount<'info>,
     
     #[account(
         init,
         payer = participant1,
-        space = BetInfo::LEN,
+        space = BetInfo::SPACE,
         seeds = [participant1.key().as_ref(), participant2.key().as_ref()],
         bump
     )]
@@ -175,21 +187,22 @@ pub struct WinCtx<'info> {
     pub oracle: Signer<'info>,
     
     #[account(mut)]
-    /// CHECK: Winner validation happens in instruction
-    pub winner: AccountInfo<'info>,
+    /// CHECK: Winner validation is done in the instruction logic
+    pub winner: UncheckedAccount<'info>,
     
     #[account(
         mut,
         seeds = [participant1.key().as_ref(), participant2.key().as_ref()],
-        bump
+        bump,
+        constraint = bet_info.oracle == oracle.key() @ BettingError::UnauthorizedOracle
     )]
     pub bet_info: Account<'info, BetInfo>,
     
     /// CHECK: Used only for PDA derivation
-    pub participant1: AccountInfo<'info>,
+    pub participant1: UncheckedAccount<'info>,
     
     /// CHECK: Used only for PDA derivation
-    pub participant2: AccountInfo<'info>,
+    pub participant2: UncheckedAccount<'info>,
     
     pub system_program: Program<'info, System>,
 }
@@ -197,17 +210,19 @@ pub struct WinCtx<'info> {
 #[derive(Accounts)]
 pub struct TimeoutCtx<'info> {
     #[account(mut)]
-    /// CHECK: Either participant can call timeout
-    pub participant1: AccountInfo<'info>,
+    /// CHECK: Participant1 address validation done through PDA constraint
+    pub participant1: UncheckedAccount<'info>,
     
     #[account(mut)]
-    /// CHECK: Either participant can call timeout
-    pub participant2: AccountInfo<'info>,
+    /// CHECK: Participant2 address validation done through PDA constraint
+    pub participant2: UncheckedAccount<'info>,
     
     #[account(
         mut,
         seeds = [participant1.key().as_ref(), participant2.key().as_ref()],
-        bump
+        bump,
+        constraint = bet_info.participant1 == participant1.key() @ BettingError::InvalidParticipant,
+        constraint = bet_info.participant2 == participant2.key() @ BettingError::InvalidParticipant
     )]
     pub bet_info: Account<'info, BetInfo>,
     
@@ -219,37 +234,65 @@ pub struct BetInfo {
     pub participant1: Pubkey,
     pub participant2: Pubkey,
     pub oracle: Pubkey,
-    pub deadline: u64,
     pub wager: u64,
-    pub total_pot: u64,
+    pub deadline: u64,
+    pub pot: u64,
     pub is_active: bool,
+    pub winner: Option<Pubkey>,
 }
 
 impl BetInfo {
-    pub const LEN: usize = 8 + // discriminator
+    pub const SPACE: usize = 8 + // discriminator
         32 + // participant1
         32 + // participant2
         32 + // oracle
-        8 + // deadline
-        8 + // wager
-        8 + // total_pot
-        1; // is_active
+        8 +  // wager
+        8 +  // deadline
+        8 +  // pot
+        1 +  // is_active
+        (1 + 32); // winner (Option<Pubkey>)
+}
+
+#[event]
+pub struct BetCreated {
+    pub bet_id: Pubkey,
+    pub participant1: Pubkey,
+    pub participant2: Pubkey,
+    pub oracle: Pubkey,
+    pub wager: u64,
+    pub deadline: u64,
+    pub pot: u64,
+}
+
+#[event]
+pub struct BetWon {
+    pub bet_id: Pubkey,
+    pub winner: Pubkey,
+    pub pot: u64,
+}
+
+#[event]
+pub struct BetTimedOut {
+    pub bet_id: Pubkey,
+    pub participant1: Pubkey,
+    pub participant2: Pubkey,
+    pub refunded_amount: u64,
 }
 
 #[error_code]
 pub enum BettingError {
     #[msg("Invalid wager amount")]
     InvalidWager,
-    #[msg("Invalid oracle")]
-    InvalidOracle,
     #[msg("Bet is not active")]
     BetNotActive,
+    #[msg("Bet has expired")]
+    BetExpired,
+    #[msg("Bet has not expired yet")]
+    BetNotExpired,
+    #[msg("Unauthorized oracle")]
+    UnauthorizedOracle,
     #[msg("Invalid winner")]
     InvalidWinner,
-    #[msg("Deadline has passed")]
-    DeadlinePassed,
-    #[msg("Deadline has not passed yet")]
-    DeadlineNotPassed,
-    #[msg("Invalid PDA")]
-    InvalidPDA,
+    #[msg("Invalid participant")]
+    InvalidParticipant,
 }

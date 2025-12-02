@@ -1,119 +1,241 @@
 use anchor_lang::prelude::*;
-use anchor_lang::system_program::{self, Transfer};
+use anchor_lang::system_program;
 
-declare_id!("3NVKnJmYvf3a2va2eJZXGAfcJJ13GgZ8fEDBdRXdKDna");
+declare_id!("HmJez9BGuzv4TDFeRhZdFjJyiys21G1DPyGKb8hx8hU9");
 
 #[program]
 pub mod escrow {
     use super::*;
 
+    /// initialize(ctx, amount, escrow_name)
+    ///  • seller = signer
+    ///  • seeds = [escrow_name, seller, buyer]
+    ///  • creates PDA account
+    ///  • state = WaitDeposit
     pub fn initialize(
         ctx: Context<InitializeCtx>,
         amount_in_lamports: u64,
-        _escrow_name: String,
+        escrow_name: String,
     ) -> Result<()> {
+        // validate
         if amount_in_lamports == 0 {
-            return err!(EscrowError::ZeroAmount);
+            return Err(ErrorCode::ZeroAmount.into());
         }
-        let info = &mut ctx.accounts.escrow_info;
-        info.seller = *ctx.accounts.seller.key;
-        info.buyer = *ctx.accounts.buyer.key;
-        info.amount_in_lamports = amount_in_lamports;
-        info.state = State::WaitDeposit;
-        info.bump = ctx.bumps.escrow_info;
-        Ok(())
-    }
-
-    pub fn deposit(ctx: Context<DepositCtx>, escrow_name: String) -> Result<()> {
-        // pull AccountInfos before mutably borrowing escrow_info
-        let buyer_ai = ctx.accounts.buyer.to_account_info();
-        let escrow_ai = ctx.accounts.escrow_info.to_account_info();
-        let system_ai = ctx.accounts.system_program.to_account_info();
-
-        let info = &mut ctx.accounts.escrow_info;
-        require!(info.state == State::WaitDeposit, EscrowError::InvalidState);
-
-        // build PDA signer seeds
-        let seller_key = ctx.accounts.seller.key();
-        let buyer_key = ctx.accounts.buyer.key();
-        let name_bytes = escrow_name.as_bytes();
-        let seeds: &[&[u8]] = &[
-            name_bytes,
-            seller_key.as_ref(),
-            buyer_key.as_ref(),
-            &[info.bump],
-        ];
-        let signer_seeds: &[&[&[u8]]] = &[seeds];
-
-        // transfer the exact amount from buyer → PDA
-        let cpi_ctx = CpiContext::new_with_signer(
-            system_ai,
-            Transfer { from: buyer_ai, to: escrow_ai },
-            signer_seeds,
+        // re-derive PDA + bump, check it matches
+        let (pda, _bump) = Pubkey::find_program_address(
+            &[
+                escrow_name.as_bytes(),
+                ctx.accounts.seller.key.as_ref(),
+                ctx.accounts.buyer.key.as_ref(),
+            ],
+            ctx.program_id,
         );
-        system_program::transfer(cpi_ctx, info.amount_in_lamports)?;
+        require!(pda == ctx.accounts.escrow_info.key(), ErrorCode::InvalidPDA);
 
-        info.state = State::WaitRecipient;
+        // initialize
+        let escrow = &mut ctx.accounts.escrow_info;
+        escrow.seller             = *ctx.accounts.seller.key;
+        escrow.buyer              = *ctx.accounts.buyer.key;
+        escrow.amount_in_lamports = amount_in_lamports;
+        escrow.state              = State::WaitDeposit;
         Ok(())
     }
 
-    pub fn pay(ctx: Context<PayCtx>, _escrow_name: String) -> Result<()> {
-        let info = &mut ctx.accounts.escrow_info;
-        require!(info.state == State::WaitRecipient, EscrowError::InvalidState);
+    /// deposit(ctx, escrow_name)
+    ///  • buyer = signer
+    ///  • must be WaitDeposit
+    ///  • transfers exact amount into PDA
+    ///  • state → WaitRecipient
+    pub fn deposit(
+        ctx: Context<DepositCtx>,
+        escrow_name: String,
+    ) -> Result<()> {
+        // manual PDA check
+        let (pda, _bump) = Pubkey::find_program_address(
+            &[
+                escrow_name.as_bytes(),
+                ctx.accounts.seller.key.as_ref(),
+                ctx.accounts.buyer.key.as_ref(),
+            ],
+            ctx.program_id,
+        );
+        require!(pda == ctx.accounts.escrow_info.key(), ErrorCode::InvalidPDA);
 
-        // Anchor will close the PDA and send all lamports (deposit + rent) to seller
-        info.state = State::Closed;
+        // state + authority checks
+        require!(
+            ctx.accounts.escrow_info.state == State::WaitDeposit,
+            ErrorCode::InvalidState
+        );
+        require!(
+            ctx.accounts.escrow_info.buyer == ctx.accounts.buyer.key(),
+            ErrorCode::Unauthorized
+        );
+
+        // do the transfer
+        let amount = ctx.accounts.escrow_info.amount_in_lamports;
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::Transfer {
+                from: ctx.accounts.buyer.to_account_info(),
+                to:   ctx.accounts.escrow_info.to_account_info(),
+            },
+        );
+        system_program::transfer(cpi_ctx, amount)?;
+
+        // flip state
+        ctx.accounts.escrow_info.state = State::WaitRecipient;
         Ok(())
     }
 
-    pub fn refund(ctx: Context<RefundCtx>, _escrow_name: String) -> Result<()> {
-        // pull AccountInfos before mutably borrowing escrow_info
-        let escrow_ai = ctx.accounts.escrow_info.to_account_info();
-        let buyer_ai = ctx.accounts.buyer.to_account_info();
+    /// pay(ctx, escrow_name)
+    ///  • buyer = signer
+    ///  • must be WaitRecipient
+    ///  • transfers full PDA lamports → seller
+    ///  • closes PDA (rent goes to seller)
+    ///  • state → Closed
+    pub fn pay(
+        ctx: Context<PayCtx>,
+        escrow_name: String,
+    ) -> Result<()> {
+        // manual PDA check
+        let (pda, bump) = Pubkey::find_program_address(
+            &[
+                escrow_name.as_bytes(),
+                ctx.accounts.seller.key.as_ref(),
+                ctx.accounts.buyer.key.as_ref(),
+            ],
+            ctx.program_id,
+        );
+        require!(pda == ctx.accounts.escrow_info.key(), ErrorCode::InvalidPDA);
 
-        let info = &mut ctx.accounts.escrow_info;
-        require!(info.state == State::WaitRecipient, EscrowError::InvalidState);
+        // state + authority
+        require!(
+            ctx.accounts.escrow_info.state == State::WaitRecipient,
+            ErrorCode::InvalidState
+        );
+        require!(
+            ctx.accounts.escrow_info.buyer == ctx.accounts.buyer.key(),
+            ErrorCode::Unauthorized
+        );
+        require!(
+            ctx.accounts.escrow_info.seller == ctx.accounts.seller.key(),
+            ErrorCode::Unauthorized
+        );
 
-        // refund exactly the deposit portion back to buyer
-        let deposit_amt = info.amount_in_lamports;
-        let mut escrow_lams = escrow_ai.try_borrow_mut_lamports()?;
-        let mut buyer_lams = buyer_ai.try_borrow_mut_lamports()?;
+        // send all lamports out
+        let total_balance = {
+            let ai = ctx.accounts.escrow_info.to_account_info();
+            ai.lamports()
+        };
+        let seeds = &[
+            escrow_name.as_bytes(),
+            ctx.accounts.seller.key.as_ref(),
+            ctx.accounts.buyer.key.as_ref(),
+            &[bump],
+        ];
+        let signer = &[&seeds[..]];
+        {
+            let cpi = CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.escrow_info.to_account_info(),
+                    to:   ctx.accounts.seller.to_account_info(),
+                },
+                signer,
+            );
+            system_program::transfer(cpi, total_balance)?;
+        }
 
-        let buyer_new = (**buyer_lams)
-            .checked_add(deposit_amt)
-            .ok_or(EscrowError::Overflow)?;
-        let escrow_new = (**escrow_lams)
-            .checked_sub(deposit_amt)
-            .ok_or(EscrowError::Overflow)?;
+        ctx.accounts.escrow_info.state = State::Closed;
+        Ok(())
+    }
 
-        **buyer_lams = buyer_new;
-        **escrow_lams = escrow_new;
+    /// refund(ctx, escrow_name)
+    ///  • seller = signer
+    ///  • must be WaitRecipient
+    ///  • refunds `amount_in_lamports` → buyer
+    ///  • closes PDA (rent → seller)
+    ///  • state → Closed
+    pub fn refund(
+        ctx: Context<RefundCtx>,
+        escrow_name: String,
+    ) -> Result<()> {
+        // manual PDA check
+        let (pda, bump) = Pubkey::find_program_address(
+            &[
+                escrow_name.as_bytes(),
+                ctx.accounts.seller.key.as_ref(),
+                ctx.accounts.buyer.key.as_ref(),
+            ],
+            ctx.program_id,
+        );
+        require!(pda == ctx.accounts.escrow_info.key(), ErrorCode::InvalidPDA);
 
-        // Anchor will close the PDA and send leftover rent lamports to seller
-        info.state = State::Closed;
+        // state + authority
+        require!(
+            ctx.accounts.escrow_info.state == State::WaitRecipient,
+            ErrorCode::InvalidState
+        );
+        require!(
+            ctx.accounts.escrow_info.buyer == ctx.accounts.buyer.key(),
+            ErrorCode::Unauthorized
+        );
+        require!(
+            ctx.accounts.escrow_info.seller == ctx.accounts.seller.key(),
+            ErrorCode::Unauthorized
+        );
+
+        // refund the buyer
+        let amount = ctx.accounts.escrow_info.amount_in_lamports;
+        let seeds = &[
+            escrow_name.as_bytes(),
+            ctx.accounts.seller.key.as_ref(),
+            ctx.accounts.buyer.key.as_ref(),
+            &[bump],
+        ];
+        let signer = &[&seeds[..]];
+        {
+            let cpi = CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.escrow_info.to_account_info(),
+                    to:   ctx.accounts.buyer.to_account_info(),
+                },
+                signer,
+            );
+            system_program::transfer(cpi, amount)?;
+        }
+
+        ctx.accounts.escrow_info.state = State::Closed;
         Ok(())
     }
 }
 
+//----------------------------- CONTEXTS -----------------------------
+
 #[derive(Accounts)]
-#[instruction(amount_in_lamports: u64, escrow_name: String)]
+#[instruction(escrow_name: String)]
 pub struct InitializeCtx<'info> {
     #[account(mut)]
     pub seller: Signer<'info>,
 
-    /// CHECK: only used as a PDA seed for derivation
+    /// CHECK: Only used to derive PDA; no on-chain checks needed here.
     pub buyer: UncheckedAccount<'info>,
 
     #[account(
         init,
-        payer = seller,
-        space = 8 + EscrowInfo::SIZE,
         seeds = [
             escrow_name.as_bytes(),
             seller.key().as_ref(),
-            buyer.key().as_ref(),
+            buyer.key().as_ref()
         ],
-        bump
+        bump,
+        payer = seller,
+        space  = 8   // discriminator
+               + 32  // seller
+               + 32  // buyer
+               + 8   // amount
+               + 1    // state
     )]
     pub escrow_info: Account<'info, EscrowInfo>,
 
@@ -121,103 +243,60 @@ pub struct InitializeCtx<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(escrow_name: String)]
 pub struct DepositCtx<'info> {
     #[account(mut)]
     pub buyer: Signer<'info>,
 
-    /// CHECK: only used as a PDA seed for derivation
+    /// CHECK: will be validated inside `deposit()` against `escrow_info.seller`
     pub seller: UncheckedAccount<'info>,
 
-    #[account(
-        mut,
-        seeds = [
-            escrow_name.as_bytes(),
-            seller.key().as_ref(),
-            buyer.key().as_ref(),
-        ],
-        bump = escrow_info.bump,
-        has_one = seller,
-        has_one = buyer,
-        constraint = escrow_info.state == State::WaitDeposit @ EscrowError::InvalidState
-    )]
+    #[account(mut)]
     pub escrow_info: Account<'info, EscrowInfo>,
 
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-#[instruction(escrow_name: String)]
 pub struct PayCtx<'info> {
-    #[account(signer)]
+    #[account(mut)]
     pub buyer: Signer<'info>,
 
-    /// CHECK: only used as a PDA seed for derivation
+    /// CHECK: validated in `pay()` against `escrow_info.seller`
     #[account(mut)]
     pub seller: UncheckedAccount<'info>,
 
-    #[account(
-        mut,
-        seeds = [
-            escrow_name.as_bytes(),
-            seller.key().as_ref(),
-            buyer.key().as_ref(),
-        ],
-        bump = escrow_info.bump,
-        has_one = seller,
-        has_one = buyer,
-        close = seller,
-        constraint = escrow_info.state == State::WaitRecipient @ EscrowError::InvalidState
-    )]
+    #[account(mut, close = seller)]
     pub escrow_info: Account<'info, EscrowInfo>,
 
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-#[instruction(escrow_name: String)]
 pub struct RefundCtx<'info> {
-    /// Seller must be mutable so the `close = seller` rent‐refund works
-    #[account(mut, signer)]
+    #[account(mut)]
     pub seller: Signer<'info>,
 
-    /// CHECK: only used as a PDA seed for derivation
+    /// CHECK: validated in `refund()` against `escrow_info.buyer`
     #[account(mut)]
     pub buyer: UncheckedAccount<'info>,
 
-    #[account(
-        mut,
-        seeds = [
-            escrow_name.as_bytes(),
-            seller.key().as_ref(),
-            buyer.key().as_ref(),
-        ],
-        bump = escrow_info.bump,
-        has_one = seller,
-        has_one = buyer,
-        close = seller,
-        constraint = escrow_info.state == State::WaitRecipient @ EscrowError::InvalidState
-    )]
+    #[account(mut, close = seller)]
     pub escrow_info: Account<'info, EscrowInfo>,
 
     pub system_program: Program<'info, System>,
 }
 
+//----------------------------- STATE & ERRORS -----------------------------
+
 #[account]
 pub struct EscrowInfo {
-    pub seller: Pubkey,
-    pub buyer: Pubkey,
+    pub seller:             Pubkey,
+    pub buyer:              Pubkey,
     pub amount_in_lamports: u64,
-    pub state: State,
-    pub bump: u8,
+    pub state:              State,
 }
 
-impl EscrowInfo {
-    // 32 + 32 + 8 + 1 + 1 = 74
-    pub const SIZE: usize = 32 + 32 + 8 + 1 + 1;
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
 pub enum State {
     WaitDeposit,
     WaitRecipient,
@@ -225,11 +304,16 @@ pub enum State {
 }
 
 #[error_code]
-pub enum EscrowError {
-    #[msg("Escrow amount must be nonzero.")]
+pub enum ErrorCode {
+    #[msg("Amount must be greater than zero")]
     ZeroAmount,
-    #[msg("Operation not allowed in the current state.")]
+
+    #[msg("Invalid state for this operation")]
     InvalidState,
-    #[msg("Lamport arithmetic overflow or underflow.")]
-    Overflow,
+
+    #[msg("Unauthorized account")]
+    Unauthorized,
+
+    #[msg("PDA derivation mismatch")]
+    InvalidPDA,
 }

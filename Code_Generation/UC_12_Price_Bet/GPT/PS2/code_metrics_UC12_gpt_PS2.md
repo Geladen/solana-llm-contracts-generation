@@ -2,9 +2,9 @@
 
 | Metric                          | Value       |
 |---------------------------------|-------------|
-| **Lines of Code**               | 301         |
-| **Comments per Line**           | 0,16 - (47) |
+| **Lines of Code**               | 252         |
+| **Comments per Line**           | 0,10 - (26) |
 | **Declared Functions**          | 4           |
-| **Lines per function**          | 32          |
-
+| **Lines per function**          | 29,5        |
+| **MCC**                         | 6           |
 

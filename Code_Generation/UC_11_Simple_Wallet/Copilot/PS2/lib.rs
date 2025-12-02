@@ -1,33 +1,39 @@
 use anchor_lang::prelude::*;
-use anchor_lang::system_program;
 use anchor_lang::solana_program::system_instruction;
 
-declare_id!("B3JB8a3YZ3ZqeVVMutFX1MjeBSqyFSMZUjseKom81W79");
+declare_id!("9YhCuQR569WZofNaLcEg136m5Vm1pZMy9SATVqYp5Fus");
 
 #[program]
 pub mod simple_wallet {
     use super::*;
 
+    // deposit: init wallet PDA if missing (zero-data PDA), then transfer lamports
     pub fn deposit(ctx: Context<DepositOrWithdrawCtx>, amount_to_deposit: u64) -> Result<()> {
         require!(amount_to_deposit > 0, WalletError::InvalidAmount);
 
-        let ix = system_instruction::transfer(
-            ctx.accounts.owner.to_account_info().key,
-            ctx.accounts.user_wallet_pda.to_account_info().key,
-            amount_to_deposit,
-        );
+        let owner = &ctx.accounts.owner;
+        let wallet_pda = &ctx.accounts.user_wallet_pda;
+
+        // ensure supplied PDA matches derivation and obtain bump
+        let (derived, bump) =
+            Pubkey::find_program_address(&[b"wallet", owner.key.as_ref()], ctx.program_id);
+        require_eq!(derived, wallet_pda.key(), WalletError::InvalidPda);
+
+        // Transfer lamports from owner to wallet PDA
+        let ix = system_instruction::transfer(&owner.key(), &wallet_pda.key(), amount_to_deposit);
         anchor_lang::solana_program::program::invoke(
             &ix,
             &[
-                ctx.accounts.owner.to_account_info(),
-                ctx.accounts.user_wallet_pda.to_account_info(),
+                owner.to_account_info(),
+                wallet_pda.to_account_info(),
                 ctx.accounts.system_program.to_account_info(),
             ],
         )?;
 
-        let balance = ctx.accounts.user_wallet_pda.to_account_info().lamports();
+        let balance = **wallet_pda.to_account_info().lamports.borrow();
+
         emit!(Deposit {
-            sender: ctx.accounts.owner.key(),
+            sender: owner.key(),
             amount: amount_to_deposit,
             balance,
         });
@@ -35,6 +41,7 @@ pub mod simple_wallet {
         Ok(())
     }
 
+    // create_transaction: initializes a transaction PDA and stores receiver & amount
     pub fn create_transaction(
         ctx: Context<CreateTransactionCtx>,
         transaction_seed: String,
@@ -42,107 +49,111 @@ pub mod simple_wallet {
     ) -> Result<()> {
         require!(transaction_lamports_amount > 0, WalletError::InvalidAmount);
 
-        let tx_account = &mut ctx.accounts.transaction_pda;
-        tx_account.receiver = ctx.accounts.receiver.key();
-        tx_account.amount_in_lamports = transaction_lamports_amount;
-        tx_account.executed = false;
+        let owner = &ctx.accounts.owner;
+        let wallet_pda = &ctx.accounts.user_wallet_pda;
+        let tx = &mut ctx.accounts.transaction_pda;
+
+        // validate wallet PDA derivation
+        let (derived, _bump) =
+            Pubkey::find_program_address(&[b"wallet", owner.key.as_ref()], ctx.program_id);
+        require_eq!(derived, wallet_pda.key(), WalletError::InvalidPda);
+
+        // check wallet balance covers the requested transaction amount
+        let wallet_balance = **wallet_pda.to_account_info().lamports.borrow();
+        require!(
+            wallet_balance >= transaction_lamports_amount,
+            WalletError::InsufficientFundsInWallet
+        );
+
+        tx.receiver = ctx.accounts.receiver.key();
+        tx.amount_in_lamports = transaction_lamports_amount;
+        tx.executed = false;
 
         emit!(SubmitTransaction {
-            tx_seed: transaction_seed,
-            sender: ctx.accounts.owner.key(),
-            receiver: tx_account.receiver,
-            amount: transaction_lamports_amount,
+            owner: owner.key(),
+            transaction: tx.key(),
+            receiver: tx.receiver,
+            amount: tx.amount_in_lamports,
         });
 
         Ok(())
     }
 
-    pub fn execute_transaction(
-        ctx: Context<ExecuteTransactionCtx>,
-        _transaction_seed: String,
-    ) -> Result<()> {
-        let tx_account = &mut ctx.accounts.transaction_pda;
+    // execute_transaction: transfer lamports from wallet PDA to receiver; close tx PDA to owner
+    pub fn execute_transaction(ctx: Context<ExecuteTransactionCtx>, _transaction_seed: String) -> Result<()> {
+        let owner = &ctx.accounts.owner;
+        let wallet_pda = &ctx.accounts.user_wallet_pda;
+        let tx = &mut ctx.accounts.transaction_pda;
+        let receiver = &ctx.accounts.receiver;
 
-        require!(!tx_account.executed, WalletError::AlreadyExecuted);
+        require!(!tx.executed, WalletError::TransactionAlreadyExecuted);
+        require!(tx.amount_in_lamports > 0, WalletError::InvalidAmount);
 
-        let amount = tx_account.amount_in_lamports;
-        require!(amount > 0, WalletError::InvalidAmount);
-
-        let wallet_lamports = ctx.accounts.user_wallet_pda.to_account_info().lamports();
-        require!(wallet_lamports >= amount, WalletError::InsufficientFunds);
-
-        // Mark executed before transfer to avoid re-execution on success/retry
-        tx_account.executed = true;
-
-        // Derive bump for wallet PDA
-        let (_pda, wallet_bump) =
-            Pubkey::find_program_address(&[b"wallet", ctx.accounts.owner.key.as_ref()], &ID);
-
-        let signer_seeds: &[&[u8]] = &[
-            b"wallet".as_ref(),
-            ctx.accounts.owner.key.as_ref(),
-            &[wallet_bump],
-        ];
-
-        let ix = system_instruction::transfer(
-            ctx.accounts.user_wallet_pda.to_account_info().key,
-            ctx.accounts.receiver.to_account_info().key,
-            amount,
+        let wallet_balance = **wallet_pda.to_account_info().lamports.borrow();
+        require!(
+            wallet_balance >= tx.amount_in_lamports,
+            WalletError::InsufficientFundsInWallet
         );
+
+        // derive bump to sign as PDA
+        let (_derived, bump) = Pubkey::find_program_address(&[b"wallet", owner.key.as_ref()], ctx.program_id);
+        let seeds: &[&[u8]] = &[b"wallet", owner.key.as_ref(), &[bump]];
+
+        let ix = system_instruction::transfer(&wallet_pda.key(), &receiver.key(), tx.amount_in_lamports);
         anchor_lang::solana_program::program::invoke_signed(
             &ix,
             &[
-                ctx.accounts.user_wallet_pda.to_account_info(),
-                ctx.accounts.receiver.to_account_info(),
+                wallet_pda.to_account_info(),
+                receiver.to_account_info(),
                 ctx.accounts.system_program.to_account_info(),
             ],
-            &[signer_seeds],
+            &[seeds],
         )?;
 
+        tx.executed = true;
+
         emit!(ExecuteTransaction {
-            sender: ctx.accounts.owner.key(),
-            receiver: ctx.accounts.receiver.key(),
-            amount,
+            owner: owner.key(),
+            transaction: tx.key(),
+            receiver: receiver.key(),
+            amount: tx.amount_in_lamports,
         });
 
         Ok(())
     }
 
+    // withdraw: transfer lamports from wallet PDA back to owner
     pub fn withdraw(ctx: Context<DepositOrWithdrawCtx>, amount_to_withdraw: u64) -> Result<()> {
         require!(amount_to_withdraw > 0, WalletError::InvalidAmount);
 
-        // ensure wallet has funds
-        let wallet_lamports = ctx.accounts.user_wallet_pda.to_account_info().lamports();
-        require!(wallet_lamports >= amount_to_withdraw, WalletError::InsufficientFunds);
+        let owner = &ctx.accounts.owner;
+        let wallet_pda = &ctx.accounts.user_wallet_pda;
 
-        // Derive bump for wallet PDA
-        let (_pda, wallet_bump) =
-            Pubkey::find_program_address(&[b"wallet", ctx.accounts.owner.key.as_ref()], &ID);
+        // derive bump and verify
+        let (_derived, bump) = Pubkey::find_program_address(&[b"wallet", owner.key.as_ref()], ctx.program_id);
+        let seeds: &[&[u8]] = &[b"wallet", owner.key.as_ref(), &[bump]];
 
-        let signer_seeds: &[&[u8]] = &[
-            b"wallet".as_ref(),
-            ctx.accounts.owner.key.as_ref(),
-            &[wallet_bump],
-        ];
-
-        let ix = system_instruction::transfer(
-            ctx.accounts.user_wallet_pda.to_account_info().key,
-            ctx.accounts.owner.to_account_info().key,
-            amount_to_withdraw,
+        let wallet_balance = **wallet_pda.to_account_info().lamports.borrow();
+        require!(
+            wallet_balance >= amount_to_withdraw,
+            WalletError::InsufficientFundsInWallet
         );
+
+        let ix = system_instruction::transfer(&wallet_pda.key(), &owner.key(), amount_to_withdraw);
         anchor_lang::solana_program::program::invoke_signed(
             &ix,
             &[
-                ctx.accounts.user_wallet_pda.to_account_info(),
-                ctx.accounts.owner.to_account_info(),
+                wallet_pda.to_account_info(),
+                owner.to_account_info(),
                 ctx.accounts.system_program.to_account_info(),
             ],
-            &[signer_seeds],
+            &[seeds],
         )?;
 
-        let balance = ctx.accounts.user_wallet_pda.to_account_info().lamports();
+        let balance = **wallet_pda.to_account_info().lamports.borrow();
+
         emit!(Withdraw {
-            sender: ctx.accounts.owner.key(),
+            sender: owner.key(),
             amount: amount_to_withdraw,
             balance,
         });
@@ -151,35 +162,24 @@ pub mod simple_wallet {
     }
 }
 
-//
-// State
-//
-
-#[account]
-pub struct UserTransaction {
-    pub receiver: Pubkey,
-    pub amount_in_lamports: u64,
-    pub executed: bool,
-}
-
-//
-// Accounts contexts
-//
+// -------------------- Accounts / Contexts --------------------
 
 #[derive(Accounts)]
 pub struct DepositOrWithdrawCtx<'info> {
+    /// Owner must sign and be mutable because lamports move from/to owner
     #[account(mut)]
     pub owner: Signer<'info>,
 
-    /// CHECK: Wallet PDA is a system-owned account with zero data so it can be used as `from` in system transfers.
-    /// Created on demand with init_if_needed; payer = owner.
+    /// CHECK: Wallet PDA is a zero-data PDA (space = 0) owned by this program and used only to hold lamports.
+    /// It is declared UncheckedAccount to ensure it carries no Anchor-managed data.
+    /// Seeds: ["wallet", owner.key().as_ref()]
+    /// init_if_needed will create it as a program-owned account with space = 0 when missing.
     #[account(
         init_if_needed,
         payer = owner,
-        space = 0,
-        owner = system_program::ID,
-        seeds = [b"wallet".as_ref(), owner.key().as_ref()],
-        bump
+        seeds = [b"wallet", owner.key().as_ref()],
+        bump,
+        space = 0
     )]
     pub user_wallet_pda: UncheckedAccount<'info>,
 
@@ -189,32 +189,25 @@ pub struct DepositOrWithdrawCtx<'info> {
 #[derive(Accounts)]
 #[instruction(transaction_seed: String)]
 pub struct CreateTransactionCtx<'info> {
+    /// owner must sign
     #[account(mut)]
     pub owner: Signer<'info>,
 
-    /// CHECK: Wallet PDA is a system-owned account with zero data; create if needed.
-    #[account(
-        init_if_needed,
-        payer = owner,
-        space = 0,
-        owner = system_program::ID,
-        seeds = [b"wallet".as_ref(), owner.key().as_ref()],
-        bump
-    )]
+    /// CHECK: Wallet PDA is a zero-data PDA used only to hold lamports; validated by PDA derivation at runtime.
+    #[account(mut, seeds = [b"wallet", owner.key().as_ref()], bump)]
     pub user_wallet_pda: UncheckedAccount<'info>,
 
-    /// Transaction PDA initialized here; payer = owner
+    /// Transaction PDA: unique per transaction_seed + wallet
     #[account(
         init,
         payer = owner,
-        space = 8 + 32 + 8 + 1,
-        seeds = [transaction_seed.as_bytes(), user_wallet_pda.to_account_info().key.as_ref()],
-        bump
+        seeds = [transaction_seed.as_bytes(), user_wallet_pda.key().as_ref()],
+        bump,
+        space = 8 + 32 + 8 + 1, // discriminator + receiver(pubkey) + amount(u64) + executed(bool)
     )]
-    pub transaction_pda: Account<'info, UserTransaction>,
+    pub transaction_pda: Box<Account<'info, UserTransactionAccount>>,
 
-    /// CHECK: Receiver of the eventual transfer. Only the Pubkey is stored in the transaction account; no on-chain validation required here.
-    #[account(mut)]
+    /// CHECK: Receiver is an unchecked account used only as the destination of lamport transfers
     pub receiver: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
@@ -223,37 +216,37 @@ pub struct CreateTransactionCtx<'info> {
 #[derive(Accounts)]
 #[instruction(transaction_seed: String)]
 pub struct ExecuteTransactionCtx<'info> {
+    /// owner must sign
     #[account(mut)]
     pub owner: Signer<'info>,
 
-    /// CHECK: Wallet PDA must be the same system-owned PDA (zero-data) derived from seeds.
-    /// It must be mutable because lamports will be debited.
-    #[account(
-        mut,
-        seeds = [b"wallet".as_ref(), owner.key().as_ref()],
-        bump
-    )]
+    /// CHECK: Wallet PDA is a zero-data PDA used only to hold lamports; validated by PDA derivation at runtime.
+    #[account(mut, seeds = [b"wallet", owner.key().as_ref()], bump)]
     pub user_wallet_pda: UncheckedAccount<'info>,
 
-    /// Transaction PDA, closed to owner after execution
-    #[account(
-        mut,
-        seeds = [transaction_seed.as_bytes(), user_wallet_pda.to_account_info().key.as_ref()],
-        bump,
-        close = owner
-    )]
-    pub transaction_pda: Account<'info, UserTransaction>,
+    /// Transaction PDA that will be closed after execution (rent returned to owner)
+    #[account(mut, seeds = [transaction_seed.as_bytes(), user_wallet_pda.key().as_ref()], bump, close = owner)]
+    pub transaction_pda: Box<Account<'info, UserTransactionAccount>>,
 
-    /// CHECK: Receiver of funds
+    /// CHECK: Receiver is an unchecked account used only as the destination of lamport transfers
     #[account(mut)]
     pub receiver: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }
 
-//
-// Events
-//
+
+// -------------------- State Structs --------------------
+
+// Transaction account stores receiver, amount, executed flag
+#[account]
+pub struct UserTransactionAccount {
+    pub receiver: Pubkey,
+    pub amount_in_lamports: u64,
+    pub executed: bool,
+}
+
+// -------------------- Events --------------------
 
 #[event]
 pub struct Deposit {
@@ -263,37 +256,38 @@ pub struct Deposit {
 }
 
 #[event]
-pub struct Withdraw {
-    pub sender: Pubkey,
-    pub amount: u64,
-    pub balance: u64,
-}
-
-#[event]
 pub struct SubmitTransaction {
-    pub tx_seed: String,
-    pub sender: Pubkey,
+    pub owner: Pubkey,
+    pub transaction: Pubkey,
     pub receiver: Pubkey,
     pub amount: u64,
 }
 
 #[event]
 pub struct ExecuteTransaction {
-    pub sender: Pubkey,
+    pub owner: Pubkey,
+    pub transaction: Pubkey,
     pub receiver: Pubkey,
     pub amount: u64,
 }
 
-//
-// Errors
-//
+#[event]
+pub struct Withdraw {
+    pub sender: Pubkey,
+    pub amount: u64,
+    pub balance: u64,
+}
+
+// -------------------- Errors --------------------
 
 #[error_code]
 pub enum WalletError {
-    #[msg("Invalid amount; must be > 0")]
+    #[msg("Invalid amount, must be > 0")]
     InvalidAmount,
     #[msg("Insufficient funds in wallet")]
-    InsufficientFunds,
+    InsufficientFundsInWallet,
     #[msg("Transaction already executed")]
-    AlreadyExecuted,
+    TransactionAlreadyExecuted,
+    #[msg("Derived PDA does not match provided account")]
+    InvalidPda,
 }

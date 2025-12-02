@@ -1,4 +1,3 @@
 ## No Identified Hallucinations
 
-**CrystalBLEU similarity: 0.299** 
-
+**CrystalBLEU similarity: 0.282** 

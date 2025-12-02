@@ -1,15 +1,14 @@
 use anchor_lang::prelude::*;
+use anchor_spl::token_interface::{self, TokenAccount, Mint, TokenInterface, TransferChecked, SetAuthority, CloseAccount};
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{self, spl_token::instruction::AuthorityType, Mint, SetAuthority, Token, TokenAccount};
 
-declare_id!("9Bgvyps4SKpKkUy9AU313xZbRs8uVEYiBa4m7zEpMSdW");
+declare_id!("EYPSnjhpTwJXT7zYFNBFUgusWgmmovFCdcaJfbmSBZYF");
 
 #[program]
-pub mod token_escrow {
+pub mod token_transfer {
     use super::*;
 
-    /// Initiates token escrow by transferring temp_ata ownership to PDA
-    /// and storing escrow information
+    /// Deposit tokens into escrow by transferring temp_ata ownership to PDA
     pub fn deposit(ctx: Context<DepositCtx>) -> Result<()> {
         let deposit_info = &mut ctx.accounts.deposit_info;
         
@@ -18,108 +17,107 @@ pub mod token_escrow {
         deposit_info.recipient = ctx.accounts.recipient.key();
         
         // Transfer ownership of temp_ata to ATAs Holder PDA
-        let cpi_accounts = SetAuthority {
-            current_authority: ctx.accounts.sender.to_account_info(),
-            account_or_mint: ctx.accounts.temp_ata.to_account_info(),
-        };
-        
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        
-        // Get ATAs Holder PDA key
         let (atas_holder_pda, _bump) = Pubkey::find_program_address(
             &[b"atas_holder"],
             ctx.program_id
         );
         
-        token::set_authority(
+        let cpi_accounts = SetAuthority {
+            account_or_mint: ctx.accounts.temp_ata.to_account_info(),
+            current_authority: ctx.accounts.sender.to_account_info(),
+        };
+        
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        
+        token_interface::set_authority(
             cpi_ctx,
-            AuthorityType::AccountOwner,
+            anchor_spl::token_interface::spl_token_2022::instruction::AuthorityType::AccountOwner,
             Some(atas_holder_pda),
         )?;
         
-        msg!("Deposit successful. Tokens escrowed for recipient: {}", deposit_info.recipient);
+        msg!("Deposit successful. Temp ATA: {}, Recipient: {}", 
+             ctx.accounts.temp_ata.key(), 
+             ctx.accounts.recipient.key());
         
         Ok(())
     }
 
-    /// Allows recipient to withdraw tokens from escrow
-    /// Closes accounts when fully withdrawn
+    /// Withdraw tokens from escrow to recipient
     pub fn withdraw(ctx: Context<WithdrawCtx>, amount_to_withdraw: u64) -> Result<()> {
+        let temp_ata = &ctx.accounts.temp_ata;
         let deposit_info = &ctx.accounts.deposit_info;
+        let mint = &ctx.accounts.mint;
         
-        // Validate that the recipient matches
+        // Verify recipient matches stored info
         require!(
             deposit_info.recipient == ctx.accounts.recipient.key(),
-            ErrorCode::UnauthorizedRecipient
+            EscrowError::InvalidRecipient
         );
         
-        // Validate that temp_ata matches
+        // Verify temp_ata matches stored info
         require!(
-            deposit_info.temp_ata == ctx.accounts.temp_ata.key(),
-            ErrorCode::InvalidTempAta
+            deposit_info.temp_ata == temp_ata.key(),
+            EscrowError::InvalidTempAta
         );
         
-        // Get mint decimals and calculate actual amount with decimals
-        let decimals = ctx.accounts.mint.decimals;
-        let decimal_multiplier = 10u64.pow(decimals as u32);
+        // Calculate actual amount with decimals
         let actual_amount = amount_to_withdraw
-            .checked_mul(decimal_multiplier)
-            .ok_or(ErrorCode::MathOverflow)?;
+            .checked_mul(10u64.pow(mint.decimals as u32))
+            .ok_or(EscrowError::MathOverflow)?;
         
-        // Get current balance of temp_ata
-        let temp_ata_balance = ctx.accounts.temp_ata.amount;
-        
-        msg!("Temp ATA balance: {}", temp_ata_balance);
-        msg!("Amount to withdraw (with decimals): {}", actual_amount);
-        
-        // Validate withdrawal amount
+        // Verify temp_ata has sufficient balance
         require!(
-            actual_amount <= temp_ata_balance,
-            ErrorCode::InsufficientBalance
+            temp_ata.amount >= actual_amount,
+            EscrowError::InsufficientBalance
         );
         
-        // Prepare PDA signer seeds
-        let seeds = &[b"atas_holder".as_ref(), &[ctx.bumps.atas_holder_pda]];
-        let signer = &[&seeds[..]];
+        // Generate PDA signer seeds
+        let seeds = &[
+            b"atas_holder".as_ref(),
+            &[ctx.bumps.atas_holder_pda],
+        ];
+        let signer_seeds = &[&seeds[..]];
         
-        // Transfer tokens from temp_ata to recipient_ata
-        let cpi_accounts = token::Transfer {
+        // Transfer tokens from temp_ata to recipient_ata using transfer_checked
+        let transfer_accounts = TransferChecked {
             from: ctx.accounts.temp_ata.to_account_info(),
             to: ctx.accounts.recipient_ata.to_account_info(),
             authority: ctx.accounts.atas_holder_pda.to_account_info(),
+            mint: ctx.accounts.mint.to_account_info(),
         };
         
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        let transfer_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            transfer_accounts,
+            signer_seeds,
+        );
         
-        token::transfer(cpi_ctx, actual_amount)?;
+        token_interface::transfer_checked(transfer_ctx, actual_amount, mint.decimals)?;
         
-        msg!("Transferred {} tokens to recipient", actual_amount);
+        msg!("Transferred {} tokens ({} with decimals) to recipient", amount_to_withdraw, actual_amount);
         
-        // Check if all tokens have been withdrawn
-        let remaining_balance = temp_ata_balance.checked_sub(actual_amount).unwrap();
+        // Reload temp_ata to check remaining balance
+        ctx.accounts.temp_ata.reload()?;
         
-        msg!("Remaining balance: {}", remaining_balance);
-        
-        if remaining_balance == 0 {
-            msg!("Closing temp_ata account...");
-            
-            // Close temp_ata account
-            let close_accounts = token::CloseAccount {
+        // If temp_ata is fully withdrawn, close accounts
+        if ctx.accounts.temp_ata.amount == 0 {
+            // Close temp_ata and return rent to sender
+            let close_accounts = CloseAccount {
                 account: ctx.accounts.temp_ata.to_account_info(),
                 destination: ctx.accounts.sender.to_account_info(),
                 authority: ctx.accounts.atas_holder_pda.to_account_info(),
             };
             
-            let close_program = ctx.accounts.token_program.to_account_info();
-            let close_ctx = CpiContext::new_with_signer(close_program, close_accounts, signer);
+            let close_ctx = CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                close_accounts,
+                signer_seeds,
+            );
             
-            token::close_account(close_ctx)?;
+            token_interface::close_account(close_ctx)?;
             
-            msg!("Temp ATA closed successfully.");
-        } else {
-            msg!("Partial withdrawal. Remaining balance: {}", remaining_balance);
+            msg!("Temp ATA closed. Escrow fully withdrawn.");
         }
         
         Ok(())
@@ -131,17 +129,21 @@ pub struct DepositCtx<'info> {
     #[account(mut)]
     pub sender: Signer<'info>,
     
-    /// CHECK: Recipient address validated in business logic
+    /// CHECK: Recipient address stored in deposit_info
     pub recipient: UncheckedAccount<'info>,
     
-    pub mint: Account<'info, Mint>,
+    #[account(
+        mint::token_program = token_program
+    )]
+    pub mint: InterfaceAccount<'info, Mint>,
     
     #[account(
         mut,
-        associated_token::mint = mint,
-        associated_token::authority = sender,
+        token::mint = mint,
+        token::authority = sender,
+        token::token_program = token_program
     )]
-    pub temp_ata: Account<'info, TokenAccount>,
+    pub temp_ata: InterfaceAccount<'info, TokenAccount>,
     
     #[account(
         init,
@@ -152,7 +154,7 @@ pub struct DepositCtx<'info> {
     )]
     pub deposit_info: Account<'info, DepositInfo>,
     
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
     pub associated_token_program: Program<'info, AssociatedToken>,
 }
@@ -162,26 +164,30 @@ pub struct WithdrawCtx<'info> {
     #[account(mut)]
     pub recipient: Signer<'info>,
     
-    /// CHECK: Sender address used for returning rent
+    /// CHECK: Sender receives rent refund when accounts are closed
     #[account(mut)]
     pub sender: UncheckedAccount<'info>,
     
-    pub mint: Account<'info, Mint>,
+    #[account(
+        mint::token_program = token_program
+    )]
+    pub mint: InterfaceAccount<'info, Mint>,
     
     #[account(
         init_if_needed,
         payer = recipient,
         associated_token::mint = mint,
         associated_token::authority = recipient,
+        associated_token::token_program = token_program
     )]
-    pub recipient_ata: Account<'info, TokenAccount>,
+    pub recipient_ata: InterfaceAccount<'info, TokenAccount>,
     
     #[account(
         mut,
-        constraint = temp_ata.mint == mint.key() @ ErrorCode::InvalidMint,
-        constraint = temp_ata.owner == atas_holder_pda.key() @ ErrorCode::InvalidAuthority,
+        token::mint = mint,
+        token::token_program = token_program
     )]
-    pub temp_ata: Account<'info, TokenAccount>,
+    pub temp_ata: InterfaceAccount<'info, TokenAccount>,
     
     #[account(
         mut,
@@ -195,10 +201,10 @@ pub struct WithdrawCtx<'info> {
         seeds = [b"atas_holder"],
         bump
     )]
-    /// CHECK: PDA used as authority for token operations
+    /// CHECK: PDA that owns the temp_ata
     pub atas_holder_pda: UncheckedAccount<'info>,
     
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub rent: Sysvar<'info, Rent>,
@@ -212,17 +218,13 @@ pub struct DepositInfo {
 }
 
 #[error_code]
-pub enum ErrorCode {
-    #[msg("Unauthorized recipient attempting to withdraw")]
-    UnauthorizedRecipient,
-    #[msg("Invalid temporary token account")]
+pub enum EscrowError {
+    #[msg("Invalid recipient")]
+    InvalidRecipient,
+    #[msg("Invalid temp ATA")]
     InvalidTempAta,
-    #[msg("Insufficient balance in escrow")]
+    #[msg("Insufficient balance in temp ATA")]
     InsufficientBalance,
-    #[msg("Invalid mint for token account")]
-    InvalidMint,
-    #[msg("Invalid authority for token account")]
-    InvalidAuthority,
-    #[msg("Math operation overflow")]
+    #[msg("Math overflow")]
     MathOverflow,
 }

@@ -1,69 +1,48 @@
 use anchor_lang::prelude::*;
-use anchor_lang::system_program;
+use anchor_lang::solana_program::system_program;
+use anchor_lang::system_program::Transfer;
 
-declare_id!("28H1btqWd9eRPpQepxHMpRcYyw2nenGWusNpzXbYoxyB");
+declare_id!("6qvR3ezKg21cJGoRyphGyKttgo1feQwihV7MKTNb9rDo");
 
 #[program]
-pub mod betting {
+pub mod bet_program {
     use super::*;
 
-    /// Both participants deposit their wagers into the PDA in one atomic call.
+    /// Both participants call this in the same transaction to place equal wagers.
     pub fn join(
-        ctx: Context<Join>,
+        ctx: Context<JoinCtx>,
         delay: u64,
         wager: u64,
     ) -> Result<()> {
-        let p1     = &ctx.accounts.participant1;
-        let p2     = &ctx.accounts.participant2;
-        let oracle = &ctx.accounts.oracle;
-        let bet    = &mut ctx.accounts.bet_info;
-
-        // Basic validation
-        require!(wager > 0, ErrorCode::InvalidWager);
-        require!(p1.key() != p2.key(), ErrorCode::SameParticipant);
-        require!(oracle.key() != p1.key(), ErrorCode::NotAuthorized);
-        require!(oracle.key() != p2.key(), ErrorCode::NotAuthorized);
-
-        // Initialize state
-        bet.participant1 = *p1.key;
-        bet.participant2 = *p2.key;
-        bet.oracle       = *oracle.key;
+        let bet = &mut ctx.accounts.bet_info;
+        bet.participant1 = *ctx.accounts.participant1.key;
+        bet.participant2 = *ctx.accounts.participant2.key;
+        bet.oracle       = *ctx.accounts.oracle.key;
+        let clock        = Clock::get()?;
+        bet.deadline     = clock.slot.checked_add(delay).unwrap();
         bet.wager        = wager;
+        // ← direct field lookup instead of `ctx.bumps.get()`
+        bet.bump         = ctx.bumps.bet_info;
 
-        // Compute and store deadline
-        let clock = Clock::get()?;
-        bet.deadline = clock
-            .slot
-            .checked_add(delay)
-            .ok_or(ErrorCode::DeadlineOverflow)?;
-
-        // Store bump, mark unsettled
-        bet.bump    = ctx.bumps.bet_info;
-        bet.settled = false;
-
-        // Transfer both wagers into the PDA
-        let sys   = ctx.accounts.system_program.to_account_info();
-        let to_pda = ctx.accounts.bet_info.to_account_info();
-
-        // Participant1 → PDA
-        system_program::transfer(
+        // transfer from participant1
+        anchor_lang::system_program::transfer(
             CpiContext::new(
-                sys.clone(),
-                system_program::Transfer {
-                    from: p1.to_account_info(),
-                    to:   to_pda.clone(),
+                ctx.accounts.system_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.participant1.to_account_info(),
+                    to:   ctx.accounts.bet_info.to_account_info(),
                 },
             ),
             wager,
         )?;
 
-        // Participant2 → PDA
-        system_program::transfer(
+        // transfer from participant2
+        anchor_lang::system_program::transfer(
             CpiContext::new(
-                sys,
-                system_program::Transfer {
-                    from: p2.to_account_info(),
-                    to:   to_pda,
+                ctx.accounts.system_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.participant2.to_account_info(),
+                    to:   ctx.accounts.bet_info.to_account_info(),
                 },
             ),
             wager,
@@ -72,220 +51,180 @@ pub mod betting {
         Ok(())
     }
 
-    /// Oracle resolves the bet before the deadline, awarding the full pot to `winner`.
-    pub fn win(ctx: Context<Win>) -> Result<()> {
-        // Extract the PDA and winner `AccountInfo` before borrowing state
-        let pda_ai    = ctx.accounts.bet_info.to_account_info();
-        let winner_ai = ctx.accounts.winner.to_account_info();
+    /// Oracle declares the winner before the deadline.
+    pub fn win(ctx: Context<WinCtx>) -> Result<()> {
+        let mut bet_info_ai     = ctx.accounts.bet_info.to_account_info();
+        let mut winner_ai       = ctx.accounts.winner.to_account_info();
 
-        // Mutable borrow of state
-        let bet   = &mut ctx.accounts.bet_info;
-        let oracle = &ctx.accounts.oracle;
-        let clock  = Clock::get()?;
+        // now that we have the AIs, borrow the state mutably
+        let bet = &mut ctx.accounts.bet_info;
 
-        // State validations
-        require!(!bet.settled, ErrorCode::AlreadySettled);
-        require!(oracle.is_signer, ErrorCode::NotAuthorized);
-        require!(oracle.key() == bet.oracle, ErrorCode::NotAuthorized);
+        require!(bet.wager > 0, ErrorCode::AlreadySettled);
+        let clock = Clock::get()?;
+        require!(clock.slot <= bet.deadline, ErrorCode::TooLateForWin);
 
-        let w_key = ctx.accounts.winner.key();
+        let wkey = ctx.accounts.winner.key();
         require!(
-            w_key == bet.participant1 || w_key == bet.participant2,
+            wkey == bet.participant1 || wkey == bet.participant2,
             ErrorCode::InvalidWinner
         );
-        require!(clock.slot <= bet.deadline, ErrorCode::DeadlinePassed);
 
-        // Compute total pot
         let pot = bet.wager.checked_mul(2).unwrap();
 
-        // Direct lamports transfer from PDA → winner    
-        {
-            let mut from_balance = pda_ai.lamports.borrow_mut();    // RefMut<&mut u64>
-            let mut to_balance   = winner_ai.lamports.borrow_mut(); // RefMut<&mut u64>
+        // manual lamport move
+        **bet_info_ai.try_borrow_mut_lamports()? -= pot;
+        **winner_ai.try_borrow_mut_lamports()?  += pot;
 
-            // Checked arithmetic on the raw u64
-            let new_from = (**from_balance)
-                .checked_sub(pot)
-                .ok_or(ErrorCode::Underflow)?;
-            let new_to = (**to_balance)
-                .checked_add(pot)
-                .ok_or(ErrorCode::LamportOverflow)?;
-
-            // Write back via double-deref
-            **from_balance = new_from;
-            **to_balance   = new_to;
-        }
-
-        bet.settled = true;
+        bet.wager = 0;
         Ok(())
     }
 
-    /// After the deadline, either participant can refund both wagers.
-    pub fn timeout(ctx: Context<Timeout>) -> Result<()> {
-        // Extract AccountInfos before borrowing state
-        let pda_ai = ctx.accounts.bet_info.to_account_info();
-        let a1_ai  = ctx.accounts.participant1.to_account_info();
-        let a2_ai  = ctx.accounts.participant2.to_account_info();
+    /// After deadline, either participant can refund their wager.
+    pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
+        let mut bet_info_ai  = ctx.accounts.bet_info.to_account_info();
+        let mut p1_ai        = ctx.accounts.participant1.to_account_info();
+        let mut p2_ai        = ctx.accounts.participant2.to_account_info();
 
         let bet = &mut ctx.accounts.bet_info;
-        let clock = Clock::get()?;
+        require!(bet.wager > 0, ErrorCode::AlreadySettled);
 
-        // State validations
-        require!(!bet.settled, ErrorCode::AlreadySettled);
-        require!(clock.slot > bet.deadline, ErrorCode::DeadlineNotReached);
+        let clock = Clock::get()?;
+        require!(clock.slot > bet.deadline, ErrorCode::TooEarlyForTimeout);
+
         require!(
-            ctx.accounts.participant1.is_signer ||
-            ctx.accounts.participant2.is_signer,
-            ErrorCode::NotAuthorized
+            ctx.accounts.participant1.is_signer
+            || ctx.accounts.participant2.is_signer,
+            ErrorCode::Unauthorized
         );
 
-        // Refund participant1
-        {
-            let mut from_balance = pda_ai.lamports.borrow_mut();
-            let mut to_balance   = a1_ai.lamports.borrow_mut();
+        let w = bet.wager;
 
-            let new_from = (**from_balance)
-                .checked_sub(bet.wager)
-                .ok_or(ErrorCode::Underflow)?;
-            let new_to = (**to_balance)
-                .checked_add(bet.wager)
-                .ok_or(ErrorCode::LamportOverflow)?;
+        // refund participant1
+        **bet_info_ai.try_borrow_mut_lamports()? -= w;
+        **p1_ai.try_borrow_mut_lamports()?       += w;
 
-            **from_balance = new_from;
-            **to_balance   = new_to;
-        }
+        // refund participant2
+        **bet_info_ai.try_borrow_mut_lamports()? -= w;
+        **p2_ai.try_borrow_mut_lamports()?       += w;
 
-        // Refund participant2
-        {
-            let mut from_balance = pda_ai.lamports.borrow_mut();
-            let mut to_balance   = a2_ai.lamports.borrow_mut();
-
-            let new_from = (**from_balance)
-                .checked_sub(bet.wager)
-                .ok_or(ErrorCode::Underflow)?;
-            let new_to = (**to_balance)
-                .checked_add(bet.wager)
-                .ok_or(ErrorCode::LamportOverflow)?;
-
-            **from_balance = new_from;
-            **to_balance   = new_to;
-        }
-
-        bet.settled = true;
+        bet.wager = 0;
         Ok(())
     }
 }
 
 #[derive(Accounts)]
 #[instruction(delay: u64, wager: u64)]
-pub struct Join<'info> {
-    /// CHECK: funds their wager
-    #[account(mut, signer)]
-    participant1: AccountInfo<'info>,
+pub struct JoinCtx<'info> {
+    /// Each participant must sign and the lamports are debited from them.
+    #[account(mut)]
+    pub participant1: Signer<'info>,
 
-    /// CHECK: funds their wager
-    #[account(mut, signer)]
-    participant2: AccountInfo<'info>,
+    #[account(mut)]
+    pub participant2: Signer<'info>,
 
-    /// CHECK: stored as the oracle’s Pubkey
-    oracle: AccountInfo<'info>,
+    /// CHECK: oracle’s pubkey is only stored in state; we do not read or write its data.
+    pub oracle: UncheckedAccount<'info>,
 
     #[account(
         init,
-        payer  = participant1,
-        space  = 8 + BetInfo::LEN,
-        seeds  = [participant1.key().as_ref(), participant2.key().as_ref()],
+        payer = participant1,
+        space = 8 + 32 + 32 + 32 + 8 + 8 + 1,
+        seeds = [
+            participant1.key().as_ref(),
+            participant2.key().as_ref()
+        ],
         bump
     )]
-    bet_info: Account<'info, BetInfo>,
+    pub bet_info: Account<'info, BetInfo>,
 
-    system_program: Program<'info, System>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct Win<'info> {
-    /// CHECK: must sign; key is verified in handler
+pub struct WinCtx<'info> {
+    /// The oracle must sign to call `win` and is checked against `bet_info.oracle`.
     #[account(signer)]
-    oracle: AccountInfo<'info>,
+    /// CHECK: we simply verify `oracle.key() == bet_info.oracle`; no further deserialization needed.
+    pub oracle: AccountInfo<'info>,
 
-    /// CHECK: the declared winner; lamports will be deposited here
+    /// The account that will receive the pot—no signature required.
     #[account(mut)]
-    winner: AccountInfo<'info>,
+    /// CHECK: we only transfer lamports into this account.
+    pub winner: AccountInfo<'info>,
 
     #[account(
         mut,
-        seeds   = [bet_info.participant1.as_ref(), bet_info.participant2.as_ref()],
-        bump    = bet_info.bump,
-        has_one = oracle
+        seeds = [
+            participant1.key().as_ref(),
+            participant2.key().as_ref()
+        ],
+        bump = bet_info.bump,
+        has_one = participant1,
+        has_one = participant2,
+        constraint = bet_info.oracle == oracle.key() @ ErrorCode::UnauthorizedOracle
     )]
-    bet_info: Account<'info, BetInfo>,
+    pub bet_info: Account<'info, BetInfo>,
 
-    /// CHECK: used for PDA derivation
-    participant1: AccountInfo<'info>,
+    /// CHECK: used only for PDA derivation; we never read or write its data.
+    pub participant1: UncheckedAccount<'info>,
 
-    /// CHECK: used for PDA derivation
-    participant2: AccountInfo<'info>,
+    /// CHECK: used only for PDA derivation; we never read or write its data.
+    pub participant2: UncheckedAccount<'info>,
 
-    system_program: Program<'info, System>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct Timeout<'info> {
-    /// CHECK: original participant
+pub struct TimeoutCtx<'info> {
+    /// One of these must sign; we enforce it manually in the handler.
     #[account(mut)]
-    participant1: AccountInfo<'info>,
+    /// CHECK: signer‐status is checked at runtime; no other data access needed.
+    pub participant1: AccountInfo<'info>,
 
-    /// CHECK: original participant
     #[account(mut)]
-    participant2: AccountInfo<'info>,
+    /// CHECK: signer‐status is checked at runtime; no other data access needed.
+    pub participant2: AccountInfo<'info>,
 
     #[account(
         mut,
-        seeds = [bet_info.participant1.as_ref(), bet_info.participant2.as_ref()],
-        bump  = bet_info.bump
+        seeds = [
+            participant1.key().as_ref(),
+            participant2.key().as_ref()
+        ],
+        bump = bet_info.bump
     )]
-    bet_info: Account<'info, BetInfo>,
+    pub bet_info: Account<'info, BetInfo>,
 
-    system_program: Program<'info, System>,
+    pub system_program: Program<'info, System>,
 }
 
 #[account]
 pub struct BetInfo {
-    participant1: Pubkey,
-    participant2: Pubkey,
-    oracle:       Pubkey,
-    deadline:     u64,
-    wager:        u64,
-    bump:         u8,
-    settled:      bool,
-}
-
-impl BetInfo {
-    /// 3×Pubkey (32 bytes each) + 2×u64 + 1×u8 + 1×bool
-    pub const LEN: usize = 32 * 3 + 8 * 2 + 1 + 1;
+    pub participant1: Pubkey,
+    pub participant2: Pubkey,
+    pub oracle:       Pubkey,
+    pub deadline:     u64,
+    pub wager:        u64,
+    pub bump:         u8,
 }
 
 #[error_code]
 pub enum ErrorCode {
-    #[msg("Wager must be non-zero.")]
-    InvalidWager,
-    #[msg("Participants must be distinct.")]
-    SameParticipant,
-    #[msg("Overflow computing deadline.")]
-    DeadlineOverflow,
-    #[msg("Not authorized.")]
-    NotAuthorized,
-    #[msg("Bet already settled.")]
+    #[msg("Bet has already been settled.")]
     AlreadySettled,
-    #[msg("Deadline not reached yet.")]
-    DeadlineNotReached,
-    #[msg("Deadline has passed.")]
-    DeadlinePassed,
-    #[msg("Winner not a participant.")]
-    InvalidWinner,
-    #[msg("Math underflow.")]
-    Underflow,
-    #[msg("Math overflow on lamports.")]
-    LamportOverflow,
-}
 
+    #[msg("Too late to call win after deadline.")]
+    TooLateForWin,
+
+    #[msg("Too early to call timeout.")]
+    TooEarlyForTimeout,
+
+    #[msg("Oracle is not authorized.")]
+    UnauthorizedOracle,
+
+    #[msg("Winner must be one of the two participants.")]
+    InvalidWinner,
+
+    #[msg("Caller is not a participant.")]
+    Unauthorized,
+}

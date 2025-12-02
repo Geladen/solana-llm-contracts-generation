@@ -1,128 +1,95 @@
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{self, CloseAccount, Mint, SetAuthority, Token, TokenAccount, Transfer, spl_token};
+use anchor_spl::token::{self, CloseAccount, SetAuthority, Transfer, Token, TokenAccount};
+use anchor_spl::token::spl_token::instruction::AuthorityType;
 
-declare_id!("HEh6WxHNNRRBFQ8D72qKqjphXwtkjRh2WufaDVWB4ueQ");
+declare_id!("3vX3hXhmk1C2UEcUGapMCk28QzepkEEdbG43c7MkkX8U");
 
 #[program]
 pub mod token_transfer {
     use super::*;
 
-    /// Sender deposits tokens into escrow
     pub fn deposit(ctx: Context<DepositCtx>) -> Result<()> {
-        let sender = &ctx.accounts.sender;
-        let temp_ata = &ctx.accounts.temp_ata;
-        let mint = &ctx.accounts.mint;
+        let deposit_info = &mut ctx.accounts.deposit_info;
 
+        // Ensure temp_ata is owned by sender
         require!(
-            temp_ata.mint == mint.key(),
-            EscrowError::TempAtaMintMismatch
+            ctx.accounts.temp_ata.owner == ctx.accounts.sender.key(),
+            EscrowError::InvalidTempAtaOwner
         );
-        require!(
-            temp_ata.owner == sender.key(),
-            EscrowError::TempAtaNotOwnedBySender
-        );
-        require!(temp_ata.amount > 0, EscrowError::TempAtaEmpty);
 
-        let (atas_holder_pda, _atas_bump) =
-            Pubkey::find_program_address(&[b"atas_holder"], ctx.program_id);
-
+        // Transfer ownership of temp_ata to PDA (atas_holder)
         let cpi_accounts = SetAuthority {
-            account_or_mint: temp_ata.to_account_info(),
-            current_authority: sender.to_account_info(),
+            account_or_mint: ctx.accounts.temp_ata.to_account_info(),
+            current_authority: ctx.accounts.sender.to_account_info(),
         };
         let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        let cpi_ctx = CpiContext::new(cpi_program.clone(), cpi_accounts);
 
-        // Fully-qualified AuthorityType
         token::set_authority(
             cpi_ctx,
-            spl_token::instruction::AuthorityType::AccountOwner,
-            Some(atas_holder_pda),
+            AuthorityType::AccountOwner,
+            Some(ctx.accounts.atas_holder.key()),
         )?;
 
-        ctx.accounts.deposit_info.temp_ata = temp_ata.key();
-        ctx.accounts.deposit_info.recipient = ctx.accounts.recipient.key();
-        ctx.accounts.deposit_info.bump = ctx.bumps.deposit_info;
+        // Initialize deposit_info
+        deposit_info.temp_ata = ctx.accounts.temp_ata.key();
+        deposit_info.recipient = ctx.accounts.recipient.key();
 
         Ok(())
     }
 
-    /// Recipient withdraws tokens from escrow
     pub fn withdraw(ctx: Context<WithdrawCtx>, amount_to_withdraw: u64) -> Result<()> {
-        let recipient = &ctx.accounts.recipient;
-        let sender = &ctx.accounts.sender;
-        let temp_ata = &ctx.accounts.temp_ata;
-        let mint = &ctx.accounts.mint;
+        let deposit_info = &ctx.accounts.deposit_info;
 
+        // Only recipient can withdraw
         require!(
-            ctx.accounts.deposit_info.temp_ata == temp_ata.key(),
-            EscrowError::DepositInfoMismatch
-        );
-        require!(
-            ctx.accounts.deposit_info.recipient == recipient.key(),
+            deposit_info.recipient == ctx.accounts.recipient.key(),
             EscrowError::UnauthorizedRecipient
         );
-        require!(temp_ata.mint == mint.key(), EscrowError::TempAtaMintMismatch);
 
-        let decimals = mint.decimals as u32;
-        let factor: u128 = 10u128
-            .checked_pow(decimals)
-            .ok_or(EscrowError::DecimalsOverflow)?;
-        let amount_raw_u128: u128 = (amount_to_withdraw as u128)
-            .checked_mul(factor)
-            .ok_or(EscrowError::AmountOverflow)?;
-        let amount_to_transfer: u64 = amount_raw_u128
-            .try_into()
-            .map_err(|_| error!(EscrowError::AmountOverflow))?;
-
-        require!(amount_to_transfer > 0, EscrowError::InvalidWithdrawAmount);
+        // PDA signer seeds
+        let (atas_holder_pda, bump) =
+            Pubkey::find_program_address(&[b"atas_holder"], ctx.program_id);
         require!(
-            amount_to_transfer <= temp_ata.amount,
-            EscrowError::InsufficientEscrowBalance
+            atas_holder_pda == ctx.accounts.atas_holder_pda.key(),
+            EscrowError::InvalidPDA
         );
 
-        let atas_bump = ctx.bumps.atas_holder_pda;
-        let signer_seeds: &[&[&[u8]]] = &[&[b"atas_holder".as_ref(), &[atas_bump]]];
+        let bump_bytes = &[bump];
+        let signer_seeds_single: &[&[u8]] = &[b"atas_holder", bump_bytes];
+        let signer_seeds: &[&[&[u8]]] = &[signer_seeds_single];
 
+        // Get temp_ata balance
+        let temp_ata_balance = ctx.accounts.temp_ata.amount;
+        require!(
+            amount_to_withdraw <= temp_ata_balance,
+            EscrowError::InsufficientFunds
+        );
+
+        // Transfer tokens to recipient
         let cpi_accounts = Transfer {
-            from: temp_ata.to_account_info(),
+            from: ctx.accounts.temp_ata.to_account_info(),
             to: ctx.accounts.recipient_ata.to_account_info(),
             authority: ctx.accounts.atas_holder_pda.to_account_info(),
         };
         let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx =
-            CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
-        token::transfer(cpi_ctx, amount_to_transfer)?;
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program.clone(), cpi_accounts, signer_seeds);
+        token::transfer(cpi_ctx, amount_to_withdraw)?;
 
-        if amount_to_transfer == temp_ata.amount {
-            let cpi_accounts_close = CloseAccount {
-                account: temp_ata.to_account_info(),
-                destination: sender.to_account_info(),
+        // Close temp_ata if full balance withdrawn
+        if amount_to_withdraw == temp_ata_balance {
+            let cpi_accounts = CloseAccount {
+                account: ctx.accounts.temp_ata.to_account_info(),
+                destination: ctx.accounts.sender.to_account_info(),
                 authority: ctx.accounts.atas_holder_pda.to_account_info(),
             };
-            let cpi_program_close = ctx.accounts.token_program.to_account_info();
-            let cpi_ctx_close = CpiContext::new_with_signer(
-                cpi_program_close,
-                cpi_accounts_close,
-                signer_seeds,
-            );
-            token::close_account(cpi_ctx_close)?;
+            let cpi_ctx = CpiContext::new_with_signer(cpi_program.clone(), cpi_accounts, signer_seeds);
+            token::close_account(cpi_ctx)?;
 
-            let deposit_info_ai = ctx.accounts.deposit_info.to_account_info();
-            let sender_ai = sender.to_account_info();
-
-            let lamports_to_move = **deposit_info_ai.lamports.borrow();
-            **sender_ai.lamports.borrow_mut() = sender_ai
-                .lamports()
-                .checked_add(lamports_to_move)
-                .ok_or(EscrowError::AmountOverflow)?;
-            **deposit_info_ai.lamports.borrow_mut() = 0;
-
-            let mut data = deposit_info_ai.data.borrow_mut();
-            for byte in data.iter_mut() {
-                *byte = 0;
-            }
+            // Close deposit_info and return lamports
+            **ctx.accounts.sender.lamports.borrow_mut() += ctx.accounts.deposit_info.to_account_info().lamports();
+            **ctx.accounts.deposit_info.to_account_info().lamports.borrow_mut() = 0;
         }
 
         Ok(())
@@ -131,14 +98,13 @@ pub mod token_transfer {
 
 #[derive(Accounts)]
 pub struct DepositCtx<'info> {
-    /// CHECK: sender must sign to authorize token authority transfer
     #[account(mut)]
     pub sender: Signer<'info>,
 
-    /// CHECK: recipient will receive the escrowed tokens; validated in deposit instruction
+    /// CHECK: Recipient can be any account
     pub recipient: UncheckedAccount<'info>,
 
-    pub mint: Account<'info, Mint>,
+    pub mint: Account<'info, token::Mint>,
 
     #[account(mut)]
     pub temp_ata: Account<'info, TokenAccount>,
@@ -146,36 +112,37 @@ pub struct DepositCtx<'info> {
     #[account(
         init,
         payer = sender,
-        space = 8 + 32 + 32 + 1,
-        seeds = [ temp_ata.key().as_ref() ],
+        space = 8 + 32 + 32,
+        seeds = [temp_ata.key().as_ref()],
         bump
     )]
     pub deposit_info: Account<'info, DepositInfo>,
+
+    #[account(
+        seeds = [b"atas_holder"],
+        bump
+    )]
+    /// CHECK: PDA holding temp_ata
+    pub atas_holder: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub associated_token_program: Program<'info, AssociatedToken>,
 }
 
+
 #[derive(Accounts)]
 pub struct WithdrawCtx<'info> {
-    /// CHECK: recipient must sign to withdraw tokens
     #[account(mut)]
     pub recipient: Signer<'info>,
 
-    /// CHECK: original sender of the escrow; used as recipient when closing accounts
     #[account(mut)]
+    /// CHECK: Sender receives lamports when deposit_info and temp ATA are closed
     pub sender: UncheckedAccount<'info>,
 
-    pub mint: Account<'info, Mint>,
+    pub mint: Account<'info, token::Mint>,
 
-    /// CHECK: recipient's ATA; init_if_needed ensures it's valid
-    #[account(
-        init_if_needed,
-        payer = recipient,
-        associated_token::mint = mint,
-        associated_token::authority = recipient
-    )]
+    #[account(mut)]
     pub recipient_ata: Account<'info, TokenAccount>,
 
     #[account(mut)]
@@ -183,15 +150,17 @@ pub struct WithdrawCtx<'info> {
 
     #[account(
         mut,
-        seeds = [ temp_ata.key().as_ref() ],
-        bump = deposit_info.bump,
-        has_one = recipient,
-        has_one = temp_ata
+        seeds = [temp_ata.key().as_ref()],
+        bump,
+        close = sender
     )]
     pub deposit_info: Account<'info, DepositInfo>,
 
-    /// CHECK: PDA that owns the temp_ata; signer via seeds
-    #[account(seeds = [b"atas_holder".as_ref()], bump)]
+    #[account(
+        seeds = [b"atas_holder"],
+        bump
+    )]
+    /// CHECK: PDA authority for temp_ata; used as signer for transfers
     pub atas_holder_pda: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
@@ -205,27 +174,19 @@ pub struct WithdrawCtx<'info> {
 pub struct DepositInfo {
     pub temp_ata: Pubkey,
     pub recipient: Pubkey,
-    pub bump: u8,
 }
 
 #[error_code]
 pub enum EscrowError {
-    #[msg("Deposit: temp ATA mint doesn't match provided mint.")]
-    TempAtaMintMismatch,
-    #[msg("Deposit: temp ATA is not owned by sender.")]
-    TempAtaNotOwnedBySender,
-    #[msg("Deposit: temp ATA has no tokens to escrow.")]
-    TempAtaEmpty,
-    #[msg("Withdraw: deposit info doesn't match the provided temp ATA.")]
-    DepositInfoMismatch,
-    #[msg("Withdraw: caller is not the recipient specified in deposit_info.")]
+    #[msg("Temporary token account is not owned by the sender.")]
+    InvalidTempAtaOwner,
+
+    #[msg("Only the designated recipient can withdraw.")]
     UnauthorizedRecipient,
-    #[msg("Decimals overflow when computing conversion factor.")]
-    DecimalsOverflow,
-    #[msg("Amount overflow after decimals conversion.")]
-    AmountOverflow,
-    #[msg("Invalid withdraw amount (zero).")]
-    InvalidWithdrawAmount,
-    #[msg("Insufficient escrow balance for requested withdraw.")]
-    InsufficientEscrowBalance,
+
+    #[msg("Invalid PDA supplied.")]
+    InvalidPDA,
+
+    #[msg("Not enough tokens in the escrow to withdraw the requested amount.")]
+    InsufficientFunds,
 }

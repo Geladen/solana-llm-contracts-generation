@@ -1,151 +1,199 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
-use anchor_lang::system_program::Transfer;
-use borsh::{BorshDeserialize, BorshSerialize};
 
-declare_id!("BCVfNzix1KJPu96WdcdEL1GZ7jkSoz6AR3JKJ9tzu36q");
+declare_id!("DKF1R2BKYCmhsKfvng7jgtQWL789kFaiPXMWHeuS7oDS");
 
 #[program]
 pub mod vault {
     use super::*;
 
-    /// Initialize the vault PDA (seeded by owner pubkey).
-    /// `owner` must sign. `initial_amount` (lamports) will be moved from owner into the vault after creation via CPI.
+    /// Initialize a vault PDA for the owner and deposit `initial_amount` lamports into it.
+    /// - signer: owner
+    /// - accounts: owner (payer, signer), recovery (Pubkey ref), vault_info (PDA init), system_program
     pub fn initialize(
         ctx: Context<InitializeCtx>,
         wait_time: u64,
         initial_amount: u64,
     ) -> Result<()> {
-        // Basic parameter checks
-        if wait_time == 0 {
-            return err!(ErrorCode::InvalidWaitTime);
-        }
-
-        // Save vault information
+        // ensure only owner can call (Anchor enforces signer)
         let vault = &mut ctx.accounts.vault_info;
-        vault.owner = *ctx.accounts.owner.key;
-        vault.recovery = *ctx.accounts.recovery.key;
+
+        // initialize fields
+        vault.owner = ctx.accounts.owner.key();
+        vault.recovery = ctx.accounts.recovery.key();
         vault.receiver = Pubkey::default();
         vault.wait_time = wait_time;
-        vault.request_time = 0;
-        vault.amount = 0;
+        vault.request_time = 0u64;
+        vault.amount = 0u64;
         vault.state = State::Idle;
 
-        // If initial_amount requested, transfer lamports from owner -> vault via system program CPI
+        // If initial_amount > 0, transfer from owner -> vault_info by manipulating lamports directly.
         if initial_amount > 0 {
-            // CPI: system_program::transfer
-            // Owner is a signer, system program will debit it
-            let cpi_accounts = Transfer {
-                from: ctx.accounts.owner.to_account_info(),
-                to: ctx.accounts.vault_info.to_account_info(),
-            };
-            let cpi_ctx = CpiContext::new(ctx.accounts.system_program.to_account_info(), cpi_accounts);
+            let cpi_ctx = CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.owner.to_account_info(),
+                    to: ctx.accounts.vault_info.to_account_info(),
+                },
+            );
             system_program::transfer(cpi_ctx, initial_amount)?;
         }
 
         Ok(())
     }
 
-    /// Owner requests a withdrawal of `amount` to `receiver`.
-    /// Moves vault into `Req` state and records request_time.
+    /// Owner creates a withdrawal request.
+    /// - signer: owner
+    /// - accounts: owner (signer), receiver (reference), vault_info (PDA)
     pub fn withdraw(ctx: Context<WithdrawCtx>, amount: u64) -> Result<()> {
+        // immutable borrow first
+        let vault_balance = ctx.accounts.vault_info.to_account_info().lamports();
+
+        // now mutable borrow
         let vault = &mut ctx.accounts.vault_info;
 
-        require!(vault.state == State::Idle, ErrorCode::InvalidState);
+        // checks
+        require!(ctx.accounts.owner.key() == vault.owner, VaultError::InvalidOwner);
+        require!(vault.state == State::Idle, VaultError::VaultNotIdle);
+        require!(amount > 0, VaultError::InvalidAmount);
+        require!((vault_balance as u64) >= amount, VaultError::InsufficientVaultFunds);
 
-        let clock = Clock::get()?;
-        vault.state = State::Req;
-        vault.amount = amount;
+        // mutate
         vault.receiver = ctx.accounts.receiver.key();
-        vault.request_time = clock.slot;
+        vault.request_time = Clock::get()?.slot;
+        vault.amount = amount;
+        vault.state = State::Req;
 
         Ok(())
     }
 
-    /// Owner finalizes a pending withdrawal after the wait time has elapsed.
-    /// Funds are transferred to `receiver`. `receiver` must match the recorded receiver in vault_info.
+    /// Owner finalizes a pending withdrawal after wait_time has elapsed.
+    /// - signer: owner
+    /// - accounts: owner (signer), receiver (mutable), vault_info (PDA)
     pub fn finalize(ctx: Context<FinalizeCtx>) -> Result<()> {
-        let vault = &mut ctx.accounts.vault_info;
-
-        require!(vault.state == State::Req, ErrorCode::InvalidState);
-
-        let clock = Clock::get()?;
-        require!(
-            clock.slot >= vault.request_time + vault.wait_time,
-            ErrorCode::WithdrawalNotReady
-        );
-
-        let vault_ai = vault.to_account_info();
+        // grab account infos first
+        let vault_ai = ctx.accounts.vault_info.to_account_info();
         let receiver_ai = ctx.accounts.receiver.to_account_info();
 
+        // now borrow mutably once
+        let vault = &mut ctx.accounts.vault_info;
+
+        // state check
+        require!(vault.state == State::Req, VaultError::InvalidState);
+
+        // slot timing check
+        let now_slot = Clock::get()?.slot;
+        let allowed_slot = vault
+            .request_time
+            .checked_add(vault.wait_time)
+            .ok_or(VaultError::TimeOverflow)?;
+        require!(now_slot >= allowed_slot, VaultError::WaitTimeNotElapsed);
+
+        // lamports transfer
         **vault_ai.try_borrow_mut_lamports()? -= vault.amount;
         **receiver_ai.try_borrow_mut_lamports()? += vault.amount;
 
-        // reset
-        vault.receiver = Pubkey::default();
-        vault.request_time = 0;
+        // reset vault state
         vault.amount = 0;
+        vault.receiver = Pubkey::default();
         vault.state = State::Idle;
-
 
         Ok(())
     }
 
-    /// Recovery key cancels a pending withdrawal request. No funds move.
+    /// Recovery key cancels a pending withdrawal, no funds moved.
+    /// - signer: recovery
+    /// - accounts: recovery (signer), owner (reference), vault_info (PDA)
     pub fn cancel(ctx: Context<CancelCtx>) -> Result<()> {
         let vault = &mut ctx.accounts.vault_info;
 
-        // Recovery signer must match the stored recovery key
-        if vault.recovery != *ctx.accounts.recovery.key {
-            return err!(ErrorCode::RecoveryMismatch);
-        }
+        // Ensure recovery key matches
+        require!(
+            ctx.accounts.recovery.key() == vault.recovery,
+            VaultError::InvalidRecoveryKey
+        );
 
-        // Provided owner reference must match vault owner
-        if vault.owner != *ctx.accounts.owner.key {
-            return err!(ErrorCode::OwnerMismatch);
-        }
+        // The "owner" reference must match vault.owner (explicitly required)
+        require!(
+            ctx.accounts.owner.key() == vault.owner,
+            VaultError::InvalidOwner
+        );
 
-        // Only valid if there's an active request
-        if vault.state != State::Req {
-            return err!(ErrorCode::NoPendingRequest);
-        }
+        // Only cancel when in Req state
+        require!(
+            vault.state == State::Req,
+            VaultError::NoPendingRequest
+        );
 
-        // Clear request state (no funds are moved)
-        vault.state = State::Idle;
+        // Reset request fields without moving funds
         vault.receiver = Pubkey::default();
-        vault.request_time = 0;
-        vault.amount = 0;
+        vault.request_time = 0u64;
+        vault.amount = 0u64;
+        vault.state = State::Idle;
 
         Ok(())
     }
 }
 
-/// -----------------------------------------------------------------------------
-/// Accounts
-/// -----------------------------------------------------------------------------
+/// Helper to get current unix timestamp as u64 with safety checks.
+fn unix_timestamp_now() -> Result<u64> {
+    let ts_i64 = Clock::get()?.unix_timestamp;
+    if ts_i64 < 0 {
+        return err!(VaultError::InvalidClockTime);
+    }
+    Ok(ts_i64 as u64)
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum State {
+    Idle = 0,
+    Req = 1,
+}
+
+
+
+/// Vault account stored at PDA [owner.key().as_ref()] with program id bump
+#[account]
+pub struct VaultInfo {
+    pub owner: Pubkey,
+    /// CHECK: recovery is only used for signature validation
+    pub recovery: Pubkey,
+    pub receiver: Pubkey,
+    pub wait_time: u64,
+    pub request_time: u64,
+    pub amount: u64,
+    pub state: State, // ✅ use State directly
+}
+
+
+// ---------- Accounts Contexts -----------
 
 #[derive(Accounts)]
 pub struct InitializeCtx<'info> {
-    /// Owner creates the vault and pays for account creation
+    /// Owner (payer) who signs
     #[account(mut)]
     pub owner: Signer<'info>,
 
-    /// Recovery key (just a reference address)
-    /// CHECK: validated/stored in VaultInfo
+    /// CHECK: This is only used to record the recovery pubkey in the vault state.
+    /// Recovery key (a reference, not signer)
+    /// This is only stored in vault_info; it does NOT have to be mutable or signer.
+    /// It can be any system account; we accept it as AccountInfo (unchecked).
+    /// Anchor doesn't require explicit type; the simplest is to accept as AccountInfo.
+    /// But keep type as `AccountInfo` to match "reference" requirement.
     pub recovery: UncheckedAccount<'info>,
 
-    /// PDA that stores vault state AND holds lamports.
-    /// Seeds exactly: [owner.key().as_ref()]
+    /// Vault PDA - created here. Seeds must be [owner.key().as_ref()].
+    /// We init the account, payer = owner.
     #[account(
         init,
         payer = owner,
-        space = VaultInfo::LEN,
         seeds = [owner.key().as_ref()],
-        bump
+        bump,
+        space = 136  // discriminator (8) + fields (calculated + padding)
     )]
     pub vault_info: Account<'info, VaultInfo>,
 
-    /// System program required for CPI transfer and init
+    /// System program required by `init`
     pub system_program: Program<'info, System>,
 }
 
@@ -154,102 +202,84 @@ pub struct WithdrawCtx<'info> {
     /// Owner must sign
     pub owner: Signer<'info>,
 
-    /// Receiver address where funds will be sent on finalize (reference)
-    /// CHECK: validated against VaultInfo.receiver on finalize
+    /// CHECK: Receiver account can be any system account. Only lamports balance is mutated.
+    /// Receiver reference (not mutable)
+    /// We accept as `UncheckedAccount` to allow any pubkey; not used to debit here.
+    /// Will be checked against stored receiver on finalize.
     pub receiver: UncheckedAccount<'info>,
 
-    /// Vault PDA - must match seeds = [owner.key().as_ref()]
-    #[account(mut, seeds = [owner.key().as_ref()], bump)]
+    /// Vault PDA (derived with [owner.key().as_ref()])
+    /// This account is read/write because we modify its state.
+    #[account(
+        mut,
+        seeds = [owner.key().as_ref()],
+        bump
+    )]
     pub vault_info: Account<'info, VaultInfo>,
 }
 
 #[derive(Accounts)]
 pub struct FinalizeCtx<'info> {
+    /// Owner signer
     pub owner: Signer<'info>,
 
-    /// Receiver must be mutable (we will deposit lamports)
-    /// CHECK: must equal vault_info.receiver
+    /// CHECK: Receiver account can be any system account. Only lamports balance is mutated.
+    /// Receiver must be mutable to accept lamports
+    /// Note: we check its Pubkey equals vault_info.receiver in handler.
     #[account(mut)]
     pub receiver: UncheckedAccount<'info>,
 
-    /// Vault PDA - must match seeds = [owner.key().as_ref()]
-    #[account(mut, seeds = [owner.key().as_ref()], bump)]
+    /// Vault PDA (mut because we update its state)
+    #[account(
+        mut,
+        seeds = [owner.key().as_ref()],
+        bump
+    )]
     pub vault_info: Account<'info, VaultInfo>,
 }
 
 #[derive(Accounts)]
 pub struct CancelCtx<'info> {
-    /// Recovery key must sign
+    /// Recovery key signer
     pub recovery: Signer<'info>,
 
-    /// Owner is provided as a reference to derive the PDA. Not a signer here.
-    /// CHECK: validated against vault_info.owner
+    /// CHECK: Owner reference is only used for pubkey comparison with vault.owner
+    /// Owner reference (not signer for this instruction)
+    /// but must match vault_info.owner
     pub owner: UncheckedAccount<'info>,
 
-    /// Vault PDA - must match seeds = [owner.key().as_ref()]
-    #[account(mut, seeds = [owner.key().as_ref()], bump)]
+    /// Vault PDA (mut because we will modify its state)
+    #[account(
+        mut,
+        seeds = [owner.key().as_ref()],
+        bump
+    )]
     pub vault_info: Account<'info, VaultInfo>,
 }
 
-/// -----------------------------------------------------------------------------
-/// State & Storage
-/// -----------------------------------------------------------------------------
-
-// Use Anchor serialization for the enum
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Debug)]
-pub enum State {
-    Idle = 0,
-    Req = 1,
-}
-
-#[account]
-pub struct VaultInfo {
-    pub owner: Pubkey,
-    pub recovery: Pubkey,
-    pub receiver: Pubkey,
-    pub wait_time: u64,    // → waitTime in JS
-    pub request_time: u64, // → requestTime in JS
-    pub amount: u64,
-    pub state: State,
-}
-
-
-
-impl VaultInfo {
-    pub const LEN: usize = 8 + (32 * 3) + (8 * 3) + 1 + 1;
-}
-
-/// -----------------------------------------------------------------------------
-/// Errors
-/// -----------------------------------------------------------------------------
+// ---------- Errors -----------
 #[error_code]
-pub enum ErrorCode {
-    #[msg("Invalid wait_time: must be nonzero")]
-    InvalidWaitTime,
-    #[msg("Invalid amount: must be > 0")]
-    InvalidAmount,
-    #[msg("Owner provided does not match vault owner")]
-    OwnerMismatch,
-    #[msg("Recovery signer does not match vault recovery key")]
-    RecoveryMismatch,
-    #[msg("A withdrawal is already requested")]
-    AlreadyRequested,
-    #[msg("No pending withdrawal request")]
+pub enum VaultError {
+    #[msg("Provided owner does not match vault owner")]
+    InvalidOwner,
+    #[msg("Provided recovery key does not match vault recovery")]
+    InvalidRecoveryKey,
+    #[msg("Vault must be in Idle state for this operation")]
+    VaultNotIdle,
+    #[msg("Vault has no pending request")]
     NoPendingRequest,
-    #[msg("Vault does not have enough funds to cover request plus rent-exempt minimum")]
-    InsufficientVaultFunds,
-    #[msg("Owner does not have enough funds")]
-    InsufficientOwnerFunds,
-    #[msg("Wait time has not yet elapsed")]
-    WaitNotElapsed,
-    #[msg("Receiver account mismatch")]
+    #[msg("Receiver does not match the pending request receiver")]
     ReceiverMismatch,
-    #[msg("Integer overflow while calculating times/amounts")]
+    #[msg("Wait time has not yet elapsed")]
+    WaitTimeNotElapsed,
+    #[msg("Vault has insufficient funds to satisfy this request")]
+    InsufficientVaultFunds,
+    #[msg("Invalid amount provided")]
+    InvalidAmount,
+    #[msg("Clock returned invalid (negative) unix timestamp")]
+    InvalidClockTime,
+    #[msg("Time arithmetic overflow")]
     TimeOverflow,
-    #[msg("Integer overflow while calculating amounts")]
-    AmountOverflow,
-    #[msg("Vault is not in the correct state for this action")]
+    #[msg("Invalid state for this operation")]
     InvalidState,
-    #[msg("Withdrawal is not ready yet (wait time not passed)")]
-    WithdrawalNotReady,
 }

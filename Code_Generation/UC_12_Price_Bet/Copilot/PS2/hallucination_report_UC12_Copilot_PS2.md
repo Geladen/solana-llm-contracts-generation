@@ -3,16 +3,14 @@
 ### Knowledge Conflicting: API Knowledge
 **Description:** 
 
-Use of deprecated module pyth_sdk_solana::load_price_feed_from_account_info and unused imports std::convert::TryInto, anchor_lang::system_program
+Incorrect usage of dependencies and incompatible APIs
 
 **Code Example:**
 ```rust
-use anchor_lang::system_program;
-use pyth_sdk_solana::load_price_feed_from_account_info;
-use std::str::FromStr;
+use pyth_client::{load_price, Price};
 ```
 
-**CrystalBLEU similarity: 0.205** 
+**CrystalBLEU similarity: 0.329** 
 
 
 

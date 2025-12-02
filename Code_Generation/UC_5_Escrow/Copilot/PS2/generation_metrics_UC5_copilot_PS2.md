@@ -2,6 +2,6 @@
 
 | Metric                          | Value     |
 |---------------------------------|-----------|
-| **Iterations to  compile**      | 5         |
-| **Iterations to pass all tests**| 9         |
+| **Iterations to  compile**      | 4         |
+| **Iterations to pass all tests**| MAX       |
 

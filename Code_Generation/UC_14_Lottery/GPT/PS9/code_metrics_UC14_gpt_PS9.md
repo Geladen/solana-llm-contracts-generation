@@ -1,0 +1,10 @@
+# Code Metrics Report
+
+| Metric                          | Value       |
+|---------------------------------|-------------|
+| **Lines of Code**               | 198         |
+| **Comments per Line**           | 0,03 - (6)  |
+| **Declared Functions**          | 4           |
+| **Lines per function**          | 27          |
+| **MCC**                         | 4           |
+

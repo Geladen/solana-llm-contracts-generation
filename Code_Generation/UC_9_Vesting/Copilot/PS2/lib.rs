@@ -1,38 +1,66 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::system_instruction;
+use anchor_lang::solana_program::{
+    self,
+    program::invoke_signed,
+    system_instruction,
+    rent::Rent,
+    system_program,
+};
 
-declare_id!("3uyPGz5hu8qVaWkFqikYxeUT4GEXneoiu1E7kSar8bH2");
+declare_id!("HnMx5Gexk6o1VSrd9h9umj7bfyHXAokvS3RYDqxNkbyL");
+
+const VAULT_SEED: &[u8] = b"vault";
 
 #[program]
-pub mod vesting {
+pub mod vesting_copilot {
     use super::*;
 
+    /// Initialize vesting metadata and create a system-owned vault PDA funded with (rent + lamports_amount).
+    /// signer: funder
     pub fn initialize(
         ctx: Context<InitializeCtx>,
         start_slot: u64,
         duration: u64,
         lamports_amount: u64,
     ) -> Result<()> {
-        require!(duration > 0, VestingError::ZeroDuration);
+        require!(duration > 0, VestingError::InvalidDuration);
+        require!(lamports_amount > 0, VestingError::InvalidAmount);
 
-        let vest = &mut ctx.accounts.vesting_info;
-        vest.released = 0;
-        vest.funder = ctx.accounts.funder.key();
-        vest.beneficiary = ctx.accounts.beneficiary.key();
-        vest.start_slot = start_slot;
-        vest.duration = duration;
+        // populate VestingInfo
+        let vesting = &mut ctx.accounts.vesting_info;
+        vesting.released = 0;
+        vesting.funder = ctx.accounts.funder.key();
+        vesting.beneficiary = ctx.accounts.beneficiary.key();
+        vesting.start_slot = start_slot;
+        vesting.duration = duration;
 
-        // Transfer lamports from funder to PDA (funder signs)
-        let ix = system_instruction::transfer(
+        // derive vault PDA and ensure passed account matches
+        let beneficiary_key = ctx.accounts.beneficiary.key();
+        let (vault_pda, _vault_bump) =
+            Pubkey::find_program_address(&[beneficiary_key.as_ref(), VAULT_SEED], ctx.program_id);
+        require_keys_eq!(vault_pda, ctx.accounts.vault.key(), VestingError::InvalidVault);
+
+        // create the vault system account with total lamports = rent + deposit
+        let rent = Rent::get()?;
+        let vault_space: usize = 0; // vault holds no data
+        let rent_lamports = rent.minimum_balance(vault_space);
+        let total_lamports = rent_lamports
+            .checked_add(lamports_amount)
+            .ok_or(VestingError::MathOverflow)?;
+
+        let create_ix = system_instruction::create_account(
             &ctx.accounts.funder.key(),
-            &ctx.accounts.vesting_info.to_account_info().key(),
-            lamports_amount,
+            &vault_pda,
+            total_lamports,
+            vault_space as u64,
+            &system_program::ID,
         );
+
         anchor_lang::solana_program::program::invoke(
-            &ix,
+            &create_ix,
             &[
                 ctx.accounts.funder.to_account_info(),
-                ctx.accounts.vesting_info.to_account_info(),
+                ctx.accounts.vault.to_account_info(),
                 ctx.accounts.system_program.to_account_info(),
             ],
         )?;
@@ -40,137 +68,144 @@ pub mod vesting {
         Ok(())
     }
 
+    /// Release vested tokens to beneficiary. signer: beneficiary
     pub fn release(ctx: Context<ReleaseCtx>) -> Result<()> {
-        // Bind AccountInfo early so temporaries live long enough
-        let vesting_ai = ctx.accounts.vesting_info.to_account_info();
-        let beneficiary_ai = ctx.accounts.beneficiary.to_account_info();
-
-        // Snapshot lamports before mutable data borrow
-        let pda_lamports_before = vesting_ai.lamports();
-
-        // Mutable borrow of account data
-        let vest_info = &mut ctx.accounts.vesting_info;
-
-        // Total original funding = released + current PDA lamports (snapshot)
-        let total_original: u128 = vest_info.released as u128 + pda_lamports_before as u128;
-        require!(total_original > 0, VestingError::NothingToRelease);
+        // validate beneficiary matches vesting info
+        let beneficiary_key = ctx.accounts.beneficiary.key();
+        require!(
+            ctx.accounts.vesting_info.beneficiary == beneficiary_key,
+            VestingError::InvalidBeneficiary
+        );
 
         let clock = Clock::get()?;
         let current_slot = clock.slot;
 
-        // Linear vesting: vested_total = total_original * elapsed_capped / duration
-        let vested_total: u128 = if current_slot <= vest_info.start_slot {
+        // Bind accountinfos locally
+        let vault_ai = ctx.accounts.vault.to_account_info();
+        let vesting_info_ai = ctx.accounts.vesting_info.to_account_info();
+
+        // total deposit is simply vault lamports + released (released is already sent out)
+        let vault_lamports = **vault_ai.lamports.borrow();
+        let released = ctx.accounts.vesting_info.released;
+        let total_deposit = vault_lamports
+            .checked_add(released)
+            .ok_or(VestingError::MathOverflow)?;
+
+        // compute vested amount linearly by slots
+        let vested_amount = if current_slot < ctx.accounts.vesting_info.start_slot {
             0u128
         } else {
-            let elapsed = current_slot.saturating_sub(vest_info.start_slot);
-            let elapsed_capped = std::cmp::min(elapsed, vest_info.duration);
-            (total_original.saturating_mul(elapsed_capped as u128))
-                .checked_div(vest_info.duration as u128)
-                .unwrap_or(0u128)
-        };
-
-        let released_so_far = vest_info.released as u128;
-        let releasable_u128 = vested_total.saturating_sub(released_so_far);
-        require!(releasable_u128 > 0, VestingError::NothingVestedYet);
-
-        // Cap releasable to PDA lamports snapshot
-        let releasable = std::cmp::min(releasable_u128, pda_lamports_before as u128) as u64;
-        require!(releasable > 0, VestingError::InsufficientPdaFunds);
-
-        // Verify PDA derived exactly from seed [beneficiary.key().as_ref()]
-        let (derived_pda, _bump) =
-            Pubkey::find_program_address(&[ctx.accounts.beneficiary.key.as_ref()], ctx.program_id);
-        require_keys_eq!(derived_pda, vesting_ai.key(), VestingError::InvalidPda);
-
-        // Transfer releasable lamports from PDA to beneficiary by mutating lamports (allowed for program-owned PDA)
-        {
-            let mut from_ref = vesting_ai.try_borrow_mut_lamports()?;
-            let mut to_ref = beneficiary_ai.try_borrow_mut_lamports()?;
-
-            **from_ref = (**from_ref)
-                .checked_sub(releasable)
-                .ok_or(VestingError::InsufficientPdaFunds)?;
-            **to_ref = (**to_ref)
-                .checked_add(releasable)
+            let elapsed = current_slot
+                .saturating_sub(ctx.accounts.vesting_info.start_slot)
+                .min(ctx.accounts.vesting_info.duration);
+            let vested = (total_deposit as u128)
+                .checked_mul(elapsed as u128)
+                .and_then(|v| v.checked_div(ctx.accounts.vesting_info.duration as u128))
                 .ok_or(VestingError::MathOverflow)?;
-        }
+            vested
+        } as u64;
 
-        // Update released amount in account data
-        vest_info.released = vest_info
-            .released
+        // releasable = vested - released
+        let releasable = vested_amount.checked_sub(released).unwrap_or(0);
+        require!(releasable > 0, VestingError::NothingToRelease);
+
+        // derive vault PDA and bump, ensure match
+        let (vault_pda, vault_bump) = Pubkey::find_program_address(
+            &[beneficiary_key.as_ref(), VAULT_SEED],
+            ctx.program_id,
+        );
+        require_keys_eq!(vault_pda, ctx.accounts.vault.key(), VestingError::InvalidVault);
+
+        // prepare signer seeds
+        let beneficiary_ref: &[u8] = beneficiary_key.as_ref();
+        let vault_seed_bytes: &[u8] = VAULT_SEED;
+        let bump_arr: [u8; 1] = [vault_bump];
+        let seeds: &[&[u8]] = &[beneficiary_ref, vault_seed_bytes, &bump_arr];
+        let signer_seeds = &[seeds];
+
+        // transfer from vault -> beneficiary
+        let ix = system_instruction::transfer(&vault_pda, &ctx.accounts.beneficiary.key(), releasable);
+        invoke_signed(
+            &ix,
+            &[
+                vault_ai.clone(),
+                ctx.accounts.beneficiary.to_account_info().clone(),
+                ctx.accounts.system_program.to_account_info().clone(),
+            ],
+            signer_seeds,
+        )?;
+
+        // update released
+        ctx.accounts.vesting_info.released = ctx.accounts.vesting_info.released
             .checked_add(releasable)
             .ok_or(VestingError::MathOverflow)?;
 
-        // Do NOT close or zero the account here. Closing is explicit via `close` instruction.
-        Ok(())
-    }
+        // if vault now empty, zero vesting_info data to render inert (and effectively closed)
+        let remaining_vault_lamports = **vault_ai.lamports.borrow();
+        if remaining_vault_lamports == 0 {
+            let mut data = vesting_info_ai.data.borrow_mut();
+            for byte in data.iter_mut() {
+                *byte = 0;
+            }
+        }
 
-    /// Explicit close instruction callable by the funder to reclaim remaining lamports and deallocate the PDA.
-    /// Funder must sign and vesting must be fully released before close.
-    pub fn close(ctx: Context<CloseCtx>) -> Result<()> {
-        let vest_info = &ctx.accounts.vesting_info;
-        let pda_lamports = ctx.accounts.vesting_info.to_account_info().lamports();
-        // total original funding equals released + whatever still sits in PDA
-        let total_original: u128 = vest_info.released as u128 + pda_lamports as u128;
-        // require that released >= total_original (no outstanding vested funds)
-        require!(
-            (vest_info.released as u128) >= total_original,
-            VestingError::NotFullyReleased
-        );
-        // Anchor will perform the actual close (close = funder in CloseCtx)
         Ok(())
     }
 }
 
+/// Accounts: keep exactly the declared accounts per instruction.
+
 #[derive(Accounts)]
-#[instruction(start_slot: u64, duration: u64, lamports_amount: u64)]
 pub struct InitializeCtx<'info> {
-    /// Funder must sign and fund the PDA
+    /// Funder must sign
     #[account(mut)]
     pub funder: Signer<'info>,
 
-    /// CHECK: plain pubkey used as PDA seed and stored in VestingInfo
+    /// CHECK: beneficiary is only used as PDA seed; stored in VestingInfo and validated on release
     pub beneficiary: UncheckedAccount<'info>,
 
-    /// Vesting PDA account: seeds = [beneficiary.key().as_ref()]
-    #[account(init, payer = funder, space = 8 + VestingInfo::SIZE, seeds = [beneficiary.key().as_ref()], bump)]
+    /// Vesting metadata PDA (program-owned) seeds = [beneficiary]
+    #[account(
+        init,
+        payer = funder,
+        space = VestingInfo::LEN,
+        seeds = [beneficiary.key().as_ref()],
+        bump
+    )]
     pub vesting_info: Account<'info, VestingInfo>,
+
+    /// CHECK: vault is a system-owned PDA (no data). Provided by caller and validated in code.
+    /// We create the vault in initialize using create_account. Vault holds lamports only.
+    #[account(mut)]
+    pub vault: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct ReleaseCtx<'info> {
-    /// Beneficiary must sign and is mutable to receive lamports
-    #[account(mut)]
+    /// Beneficiary must sign
+    #[account(mut, signer)]
     pub beneficiary: Signer<'info>,
 
-    /// CHECK: funder is a reference here (used only when calling explicit close)
+    /// CHECK: funder is only used as the recipient of returned rent lamports on final close.
+    /// No signature required; we only need its pubkey at runtime.
+    #[account(mut)]
     pub funder: UncheckedAccount<'info>,
 
-    /// Vesting PDA account (seeds = [beneficiary.key().as_ref()])
-    #[account(mut, seeds = [beneficiary.key().as_ref()], bump)]
+    /// Vesting metadata PDA (program-owned)
+    #[account(mut, seeds=[beneficiary.key().as_ref()], bump)]
     pub vesting_info: Account<'info, VestingInfo>,
+
+    /// CHECK: vault is a system-owned PDA (no data) that holds lamports.
+    /// We validate it at runtime by deriving the expected PDA and comparing pubkeys.
+    #[account(mut)]
+    pub vault: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }
 
-#[derive(Accounts)]
-pub struct CloseCtx<'info> {
-    /// Funder must sign to receive remaining lamports and allow deallocation
-    #[account(mut, signer)]
-    pub funder: Signer<'info>,
-
-    /// Vesting PDA account to close; Anchor will transfer lamports to `funder` and deallocate it
-    #[account(mut, seeds = [beneficiary.key().as_ref()], bump, close = funder)]
-    pub vesting_info: Account<'info, VestingInfo>,
-
-    /// CHECK: beneficiary provided for PDA derivation consistency
-    pub beneficiary: UncheckedAccount<'info>,
-
-    pub system_program: Program<'info, System>,
-}
-
+/// VestingInfo structure exactly as requested
 #[account]
 pub struct VestingInfo {
     pub released: u64,
@@ -181,24 +216,23 @@ pub struct VestingInfo {
 }
 
 impl VestingInfo {
-    // u64 + Pubkey + Pubkey + u64 + u64
-    pub const SIZE: usize = 8 + 32 + 32 + 8 + 8;
+    // discriminator + fields
+    pub const LEN: usize = 8 + 8 + 32 + 32 + 8 + 8;
 }
 
+/// Errors
 #[error_code]
 pub enum VestingError {
     #[msg("Duration must be > 0")]
-    ZeroDuration,
-    #[msg("Nothing vested yet")]
-    NothingVestedYet,
-    #[msg("No funds present in PDA")]
+    InvalidDuration,
+    #[msg("Lamports amount must be > 0")]
+    InvalidAmount,
+    #[msg("Nothing is available for release")]
     NothingToRelease,
-    #[msg("PDA has insufficient lamports for requested release")]
-    InsufficientPdaFunds,
-    #[msg("Math overflow")]
+    #[msg("Math overflow occurred")]
     MathOverflow,
-    #[msg("Invalid PDA derived from seeds")]
-    InvalidPda,
-    #[msg("Vesting not yet fully released")]
-    NotFullyReleased,
+    #[msg("Vesting info beneficiary mismatch")]
+    InvalidBeneficiary,
+    #[msg("Vault PDA mismatch")]
+    InvalidVault,
 }

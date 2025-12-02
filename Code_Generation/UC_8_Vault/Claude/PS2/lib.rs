@@ -1,142 +1,156 @@
 use anchor_lang::prelude::*;
-use borsh::{BorshDeserialize, BorshSerialize};
 
-declare_id!("4X2UhEnx9UbCNdRbECsyYavwQk7W6dYoJFHuS7StPyfr");
+declare_id!("A2ejAosLbiSsZ1gLVwLdarzhkvnMS7qZ3Mfyjud6cePt");
 
 #[program]
 pub mod vault {
     use super::*;
 
+    /// Initialize a new time-locked vault
+    /// Only the owner can call this function
     pub fn initialize(
-        ctx: Context<InitializeCtx>, 
-        wait_time: u64, 
-        initial_amount: u64
+        ctx: Context<InitializeCtx>,
+        wait_time: u64,
+        initial_amount: u64,
     ) -> Result<()> {
-        require!(wait_time > 0, VaultError::InvalidWaitTime);
-        require!(initial_amount > 0, VaultError::InvalidAmount);
-
         let vault_info = &mut ctx.accounts.vault_info;
+        
+        // Validate wait_time (must be at least 1 second)
+        require!(wait_time > 0, VaultError::InvalidWaitTime);
         
         // Initialize vault state
         vault_info.owner = ctx.accounts.owner.key();
         vault_info.recovery = ctx.accounts.recovery.key();
-        vault_info.receiver = Pubkey::default(); // Will be set during withdrawal
+        vault_info.receiver = Pubkey::default(); // Will be set during withdraw
         vault_info.wait_time = wait_time;
         vault_info.request_time = 0;
         vault_info.amount = 0;
         vault_info.state = State::Idle;
 
-        // Transfer initial funds to vault
-        let ix = anchor_lang::system_program::Transfer {
-            from: ctx.accounts.owner.to_account_info(),
-            to: ctx.accounts.vault_info.to_account_info(),
-        };
-        
-        let cpi_ctx = CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            ix,
-        );
-        
-        anchor_lang::system_program::transfer(cpi_ctx, initial_amount)?;
+        // Transfer initial amount to vault if specified
+        if initial_amount > 0 {
+            let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
+                &ctx.accounts.owner.key(),
+                &vault_info.key(),
+                initial_amount,
+            );
 
-        msg!("Vault initialized with {} lamports, wait time: {} slots", 
-             initial_amount, wait_time);
+            anchor_lang::solana_program::program::invoke(
+                &transfer_ix,
+                &[
+                    ctx.accounts.owner.to_account_info(),
+                    vault_info.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
 
+        msg!("Vault initialized with wait_time: {} seconds", wait_time);
         Ok(())
     }
 
+    /// Initiate a withdrawal request
+    /// Only the owner can call this function
     pub fn withdraw(ctx: Context<WithdrawCtx>, amount: u64) -> Result<()> {
-        require!(amount > 0, VaultError::InvalidAmount);
-        
         let vault_info = &mut ctx.accounts.vault_info;
         let clock = Clock::get()?;
 
         // Verify vault is in idle state
-        require!(vault_info.state == State::Idle, VaultError::InvalidState);
-
-        // Check sufficient balance
+        require!(vault_info.state == State::Idle, VaultError::VaultNotIdle);
+        
+        // Validate amount
+        require!(amount > 0, VaultError::InvalidAmount);
+        
+        // Check if vault has sufficient balance
         let vault_balance = vault_info.to_account_info().lamports();
-        require!(vault_balance >= amount, VaultError::InsufficientFunds);
+        let rent_exempt_minimum = Rent::get()?.minimum_balance(vault_info.to_account_info().data_len());
+        let available_balance = vault_balance.saturating_sub(rent_exempt_minimum);
+        
+        require!(amount <= available_balance, VaultError::InsufficientBalance);
 
-        // Set withdrawal request using slot-based timing
+        // Set withdrawal request using slot number for timing
         vault_info.receiver = ctx.accounts.receiver.key();
         vault_info.amount = amount;
         vault_info.request_time = clock.slot;
         vault_info.state = State::Req;
 
-        msg!("Withdrawal request initiated for {} lamports to {}, wait until slot: {}", 
-             amount, 
-             vault_info.receiver,
-             vault_info.request_time + vault_info.wait_time);
-
+        msg!("Withdrawal request initiated for {} lamports to {} at slot {}", amount, ctx.accounts.receiver.key(), clock.slot);
         Ok(())
     }
 
+    /// Finalize the withdrawal after wait time has elapsed
+    /// Only the owner can call this function
     pub fn finalize(ctx: Context<FinalizeCtx>) -> Result<()> {
         let vault_info = &mut ctx.accounts.vault_info;
         let clock = Clock::get()?;
 
         // Verify vault is in request state
-        require!(vault_info.state == State::Req, VaultError::InvalidState);
-
-        // Verify receiver matches the one in request
+        require!(vault_info.state == State::Req, VaultError::NoWithdrawalRequest);
+        
+        // Verify receiver matches the one from withdrawal request
         require!(
-            vault_info.receiver == ctx.accounts.receiver.key(),
-            VaultError::InvalidReceiver
+            ctx.accounts.receiver.key() == vault_info.receiver,
+            VaultError::ReceiverMismatch
         );
 
-        // Check if wait time has elapsed using slot-based timing
-        let current_slot = clock.slot;
-        let required_slot = vault_info.request_time + vault_info.wait_time;
-        require!(current_slot >= required_slot, VaultError::WaitTimeNotElapsed);
+        // Check if wait time has elapsed
+        let current_time = clock.unix_timestamp as u64;
+        let elapsed_time = current_time.saturating_sub(vault_info.request_time);
+        
+        require!(elapsed_time >= vault_info.wait_time, VaultError::WaitTimeNotElapsed);
 
-        // Transfer funds
+        // Perform the transfer
         let amount = vault_info.amount;
-        let vault_account_info = vault_info.to_account_info();
-        let vault_lamports = vault_account_info.lamports();
-        require!(vault_lamports >= amount, VaultError::InsufficientFunds);
+        let owner_key = vault_info.owner;
+        
+        // Generate signer seeds for PDA
+        let owner_key = vault_info.owner;
+        let (_, bump) = Pubkey::find_program_address(&[owner_key.as_ref()], ctx.program_id);
+        let signer_seeds: &[&[&[u8]]] = &[&[owner_key.as_ref(), &[bump]]];
 
-        **vault_account_info.try_borrow_mut_lamports()? -= amount;
-        **ctx.accounts.receiver.try_borrow_mut_lamports()? += amount;
+        // Transfer lamports from vault to receiver
+        **vault_info.to_account_info().try_borrow_mut_lamports()? -= amount;
+        **ctx.accounts.receiver.to_account_info().try_borrow_mut_lamports()? += amount;
 
-        // Reset vault state
+        // Reset vault to idle state
         vault_info.receiver = Pubkey::default();
         vault_info.amount = 0;
         vault_info.request_time = 0;
         vault_info.state = State::Idle;
 
-        msg!("Withdrawal finalized: {} lamports transferred to {}", 
-             amount, 
-             ctx.accounts.receiver.key());
-
+        msg!("Withdrawal finalized: {} lamports transferred to {}", amount, ctx.accounts.receiver.key());
         Ok(())
     }
 
+    /// Cancel a pending withdrawal request
+    /// Only the recovery key can call this function
     pub fn cancel(ctx: Context<CancelCtx>) -> Result<()> {
         let vault_info = &mut ctx.accounts.vault_info;
 
         // Verify vault is in request state
-        require!(vault_info.state == State::Req, VaultError::InvalidState);
+        require!(vault_info.state == State::Req, VaultError::NoWithdrawalRequest);
 
-        // Reset vault state without transferring funds
+        // Reset vault to idle state without transferring funds
         vault_info.receiver = Pubkey::default();
         vault_info.amount = 0;
         vault_info.request_time = 0;
         vault_info.state = State::Idle;
 
         msg!("Withdrawal request cancelled by recovery key");
-
         Ok(())
     }
 }
 
-// Context structures
+// Context structs for each instruction
+
 #[derive(Accounts)]
 pub struct InitializeCtx<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
-    /// CHECK: Recovery key address validation
-    pub recovery: UncheckedAccount<'info>,
+    
+    /// CHECK: Recovery key is validated but not required to sign for initialization
+    pub recovery: AccountInfo<'info>,
+    
     #[account(
         init,
         payer = owner,
@@ -145,17 +159,21 @@ pub struct InitializeCtx<'info> {
         bump
     )]
     pub vault_info: Account<'info, VaultInfo>,
+    
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct WithdrawCtx<'info> {
     #[account(
-        constraint = vault_info.owner == owner.key() @ VaultError::Unauthorized
+        mut,
+        constraint = owner.key() == vault_info.owner @ VaultError::Unauthorized
     )]
     pub owner: Signer<'info>,
-    /// CHECK: Receiver address validation
-    pub receiver: UncheckedAccount<'info>,
+    
+    /// CHECK: Receiver account is validated during withdrawal setup
+    pub receiver: AccountInfo<'info>,
+    
     #[account(
         mut,
         seeds = [owner.key().as_ref()],
@@ -167,28 +185,14 @@ pub struct WithdrawCtx<'info> {
 #[derive(Accounts)]
 pub struct FinalizeCtx<'info> {
     #[account(
-        constraint = vault_info.owner == owner.key() @ VaultError::Unauthorized
+        constraint = owner.key() == vault_info.owner @ VaultError::Unauthorized
     )]
     pub owner: Signer<'info>,
+    
     #[account(mut)]
-    /// CHECK: Receiver validation done in instruction logic
-    pub receiver: UncheckedAccount<'info>,
-    #[account(
-        mut,
-        seeds = [vault_info.owner.as_ref()],
-        bump
-    )]
-    pub vault_info: Account<'info, VaultInfo>,
-}
-
-#[derive(Accounts)]
-pub struct CancelCtx<'info> {
-    #[account(
-        constraint = vault_info.recovery == recovery.key() @ VaultError::Unauthorized
-    )]
-    pub recovery: Signer<'info>,
-    /// CHECK: Owner reference validation
-    pub owner: UncheckedAccount<'info>,
+    /// CHECK: Receiver is validated against vault_info.receiver
+    pub receiver: AccountInfo<'info>,
+    
     #[account(
         mut,
         seeds = [owner.key().as_ref()],
@@ -197,43 +201,62 @@ pub struct CancelCtx<'info> {
     pub vault_info: Account<'info, VaultInfo>,
 }
 
-// Data structures
+#[derive(Accounts)]
+pub struct CancelCtx<'info> {
+    #[account(
+        constraint = recovery.key() == vault_info.recovery @ VaultError::Unauthorized
+    )]
+    pub recovery: Signer<'info>,
+    
+    /// CHECK: Owner reference for vault validation
+    pub owner: AccountInfo<'info>,
+    
+    #[account(
+        mut,
+        seeds = [owner.key().as_ref()],
+        bump
+    )]
+    pub vault_info: Account<'info, VaultInfo>,
+}
+
+// Account structures
+
 #[account]
+#[derive(InitSpace)]
 pub struct VaultInfo {
-    pub owner: Pubkey,      // 32 bytes
-    pub recovery: Pubkey,   // 32 bytes
-    pub receiver: Pubkey,   // 32 bytes
-    pub wait_time: u64,     // 8 bytes
-    pub request_time: u64,  // 8 bytes
-    pub amount: u64,        // 8 bytes
-    pub state: State,       // 1 byte
+    pub owner: Pubkey,
+    pub recovery: Pubkey,
+    pub receiver: Pubkey,
+    pub wait_time: u64,
+    pub request_time: u64,
+    pub amount: u64,
+    pub state: State,
 }
 
-impl VaultInfo {
-    pub const INIT_SPACE: usize = 32 + 32 + 32 + 8 + 8 + 8 + 1;
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, PartialEq, Eq, Clone, Copy)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, InitSpace)]
 pub enum State {
     Idle = 0,
     Req = 1,
 }
 
 // Error definitions
+
 #[error_code]
 pub enum VaultError {
     #[msg("Unauthorized access")]
     Unauthorized,
-    #[msg("Invalid vault state for this operation")]
-    InvalidState,
     #[msg("Invalid wait time - must be greater than 0")]
     InvalidWaitTime,
     #[msg("Invalid amount - must be greater than 0")]
     InvalidAmount,
-    #[msg("Insufficient funds in vault")]
-    InsufficientFunds,
-    #[msg("Wait time has not elapsed yet - need to wait more slots")]
+    #[msg("Insufficient balance in vault")]
+    InsufficientBalance,
+    #[msg("Vault is not in idle state")]
+    VaultNotIdle,
+    #[msg("No withdrawal request pending")]
+    NoWithdrawalRequest,
+    #[msg("Wait time has not elapsed")]
     WaitTimeNotElapsed,
-    #[msg("Invalid receiver address")]
-    InvalidReceiver,
+    #[msg("Receiver account mismatch")]
+    ReceiverMismatch,
 }

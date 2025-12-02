@@ -1,138 +1,110 @@
 use anchor_lang::prelude::*;
-use anchor_lang::system_program;
-use pyth_sdk_solana::load_price_feed_from_account_info;
-use std::convert::TryInto;
+use anchor_lang::solana_program::program::invoke;
+use anchor_lang::solana_program::system_instruction;
+use anchor_lang::solana_program::sysvar::clock::Clock;
+use pyth_client::{load_price, Price};
 
-declare_id!("DGqH7rzxnj3iaqPBWFWfmoHSvense9b1XLZ5Xk91fUEu");
-
-const MAX_STALENESS_SECONDS: i64 = 300; // 5 minutes
-const BET_INFO_SIZE: usize = 8 + 32 + 32 + 8 + 8 + 8; // discriminator + owner + player + wager + deadline + rate
+declare_id!("4Ghm1P18qwp45b3ufwHhNsFF4EwpbmYTXENRUjZ37wXH");
 
 #[program]
 pub mod price_bet {
     use super::*;
 
     pub fn init(ctx: Context<InitCtx>, delay: u64, wager: u64, rate: u64) -> Result<()> {
-        require!(wager > 0, ErrorCode::InvalidWager);
-        require!(rate > 0, ErrorCode::InvalidRate);
-
         let clock = Clock::get()?;
-        require!(clock.unix_timestamp >= 0, ErrorCode::NegativeTimestamp);
-        let now_u64: u64 = clock.unix_timestamp as u64;
+        let deadline = clock.slot.checked_add(delay).ok_or(ErrorCode::Overflow)?;
 
-        let deadline = now_u64
-            .checked_add(delay)
-            .ok_or(error!(ErrorCode::Overflow))?;
-
-        // Transfer the initial wager from owner to the bet PDA before mutably writing into bet account
-        let bet_info_ai = ctx.accounts.bet_info.to_account_info();
-        let cpi_accounts = anchor_lang::system_program::Transfer {
-            from: ctx.accounts.owner.to_account_info(),
-            to: bet_info_ai.clone(),
-        };
-        let cpi_program = ctx.accounts.system_program.to_account_info();
-        anchor_lang::system_program::transfer(
-            CpiContext::new(cpi_program, cpi_accounts),
-            wager,
-        )?;
-
-        // Now safely write to the bet account
         let bet = &mut ctx.accounts.bet_info;
-        bet.owner = ctx.accounts.owner.key();
+        bet.owner = *ctx.accounts.owner.key;
         bet.player = Pubkey::default();
         bet.wager = wager;
         bet.deadline = deadline;
         bet.rate = rate;
 
+        if wager > 0 {
+            let ix = system_instruction::transfer(
+                ctx.accounts.owner.key,
+                ctx.accounts.bet_info.to_account_info().key,
+                wager,
+            );
+            invoke(
+                &ix,
+                &[
+                    ctx.accounts.owner.to_account_info(),
+                    ctx.accounts.bet_info.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+
         Ok(())
     }
 
     pub fn join(ctx: Context<JoinCtx>) -> Result<()> {
-        // Read immutable fields first to avoid borrow conflicts
-        let bet_ai = ctx.accounts.bet_info.to_account_info();
-        let bet_read = &ctx.accounts.bet_info;
+        let bet = &mut ctx.accounts.bet_info;
+        require!(bet.owner == *ctx.accounts.owner.key, ErrorCode::InvalidOwner);
+        require!(bet.player == Pubkey::default(), ErrorCode::AlreadyJoined);
+        require!(ctx.accounts.player.key() != ctx.accounts.owner.key(), ErrorCode::OwnerCannotJoin);
+        require!(bet.wager > 0, ErrorCode::InvalidWagerAmount);
 
-        // Basic checks using immutable borrow
-        let clock = Clock::get()?;
-        require!(clock.unix_timestamp >= 0, ErrorCode::NegativeTimestamp);
-        let now_u64 = clock.unix_timestamp as u64;
-
-        require!(now_u64 <= bet_read.deadline, ErrorCode::DeadlinePassed);
-        require!(bet_read.player == Pubkey::default(), ErrorCode::AlreadyJoined);
-        require!(ctx.accounts.player.key() != bet_read.owner, ErrorCode::OwnerCannotJoin);
-        require!(ctx.accounts.owner.key() == bet_read.owner, ErrorCode::InvalidOwnerReference);
-
-        // Transfer matching wager from player to PDA
-        let wager = bet_read.wager;
-        let cpi_accounts = anchor_lang::system_program::Transfer {
-            from: ctx.accounts.player.to_account_info(),
-            to: bet_ai.clone(),
-        };
-        let cpi_program = ctx.accounts.system_program.to_account_info();
-        anchor_lang::system_program::transfer(
-            CpiContext::new(cpi_program, cpi_accounts),
-            wager,
+        let ix = system_instruction::transfer(
+            ctx.accounts.player.key,
+            ctx.accounts.bet_info.to_account_info().key,
+            bet.wager,
+        );
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.player.to_account_info(),
+                ctx.accounts.bet_info.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
         )?;
 
-        // Mutably set player
-        let bet = &mut ctx.accounts.bet_info;
-        bet.player = ctx.accounts.player.key();
-
+        bet.player = *ctx.accounts.player.key;
         Ok(())
     }
 
     pub fn win(ctx: Context<WinCtx>) -> Result<()> {
-        // Verify player is signer and matches stored player
         let bet = &ctx.accounts.bet_info;
-        require!(ctx.accounts.player.key() == bet.player, ErrorCode::NotPlayer);
-        require!(ctx.accounts.owner.key() == bet.owner, ErrorCode::InvalidOwnerReference);
+        require!(bet.player == *ctx.accounts.player.key, ErrorCode::NotBetPlayer);
 
         let clock = Clock::get()?;
-        require!(clock.unix_timestamp >= 0, ErrorCode::NegativeTimestamp);
-        let now = clock.unix_timestamp as i64;
-        require!(now as u64 >= bet.deadline, ErrorCode::TooEarlyToResolve);
+        require!(clock.slot >= bet.deadline, ErrorCode::TooEarlyToResolve);
 
-        // Load and validate Pyth price feed account
-        let price_feed = load_price_feed_from_account_info(&ctx.accounts.price_feed)
-            .map_err(|_| error!(ErrorCode::InvalidOracleAccount))?;
+        let pyth_program_id = pyth_client::ID;
+        require!(ctx.accounts.price_feed.owner == &pyth_program_id, ErrorCode::InvalidOracleOwner);
 
-        // Get price info and validate
-        let pyth_price = price_feed.get_price_unchecked();
-        let publish_time = pyth_price.publish_time; // i64
-        let price_mantissa = pyth_price.price; // i64
+        let price: Price = load_price(&ctx.accounts.price_feed).ok_or(ErrorCode::InvalidOracleData)?;
+        let price_slot = price.valid_slot;
+        let slot_now = clock.slot;
+        const MAX_STALE_SLOTS: u64 = 300;
+        require!(slot_now.checked_sub(price_slot).unwrap_or(u64::MAX) <= MAX_STALE_SLOTS, ErrorCode::StaleOraclePrice);
 
-        require!(publish_time > 0, ErrorCode::InvalidOracleData);
-        require!(price_mantissa != 0, ErrorCode::InvalidOracleData);
+        let agg_price = price.agg.price;
+        let expo = price.expo;
 
-        // Staleness check (seconds)
-        let age = now
-            .checked_sub(publish_time)
-            .ok_or(error!(ErrorCode::StalePrice))?;
-        require!(age <= MAX_STALENESS_SECONDS, ErrorCode::StalePrice);
+        let mut oracle_scaled: i128 = agg_price as i128;
+        let mut rate_scaled: i128 = bet.rate as i128;
 
-        // Compare mantissas directly: both are integer mantissas (owner must store rate in same units)
-        let current_mantissa = price_mantissa as i128;
-        let target_mantissa = bet.rate as i128;
-
-        if current_mantissa >= target_mantissa {
-            // Closing is handled by Anchor because bet_info has `close = player` in WinCtx accounts
-            Ok(())
-        } else {
-            Err(error!(ErrorCode::ConditionNotMet))
+        if expo < 0 {
+            let mult = 10i128.checked_pow((-expo) as u32).ok_or(ErrorCode::Overflow)?;
+            rate_scaled = rate_scaled.checked_mul(mult).ok_or(ErrorCode::Overflow)?;
+        } else if expo > 0 {
+            let mult = 10i128.checked_pow(expo as u32).ok_or(ErrorCode::Overflow)?;
+            oracle_scaled = oracle_scaled.checked_mul(mult).ok_or(ErrorCode::Overflow)?;
         }
+
+        require!(oracle_scaled >= rate_scaled, ErrorCode::PlayerDidNotWin);
+        Ok(())
     }
 
     pub fn timeout(ctx: Context<TimeoutCtx>) -> Result<()> {
-        // Owner reclaim after deadline
         let bet = &ctx.accounts.bet_info;
-        require!(ctx.accounts.owner.key() == bet.owner, ErrorCode::InvalidOwner);
+        require!(bet.owner == *ctx.accounts.owner.key, ErrorCode::InvalidOwner);
 
         let clock = Clock::get()?;
-        require!(clock.unix_timestamp >= 0, ErrorCode::NegativeTimestamp);
-        let now_u64 = clock.unix_timestamp as u64;
-        require!(now_u64 >= bet.deadline, ErrorCode::TooEarlyToResolve);
-
-        // Closing handled by Anchor with `close = owner` in account attributes
+        require!(clock.slot >= bet.deadline, ErrorCode::TooEarlyToResolve);
         Ok(())
     }
 }
@@ -144,19 +116,18 @@ pub struct OracleBetInfo {
     pub wager: u64,
     pub deadline: u64,
     pub rate: u64,
+    pub bump: u8,
 }
 
 #[derive(Accounts)]
 pub struct InitCtx<'info> {
-    /// Owner must sign
-    #[account(mut)]
+    #[account(mut, signer)]
     pub owner: Signer<'info>,
 
-    /// Bet PDA seeded exactly as [owner.key().as_ref()]
     #[account(
         init,
         payer = owner,
-        space = BET_INFO_SIZE,
+        space = 8 + std::mem::size_of::<OracleBetInfo>(),
         seeds = [owner.key().as_ref()],
         bump
     )]
@@ -167,16 +138,18 @@ pub struct InitCtx<'info> {
 
 #[derive(Accounts)]
 pub struct JoinCtx<'info> {
-    /// Player must sign
-    #[account(mut)]
+    #[account(mut, signer)]
     pub player: Signer<'info>,
 
-    /// Owner reference only (used to verify PDA seeds)
-    /// CHECK: read-only reference
-    pub owner: UncheckedAccount<'info>,
+    /// CHECK: owner used only for PDA derivation
+    pub owner: AccountInfo<'info>,
 
-    /// PDA seeded by owner
-    #[account(mut, seeds = [owner.key().as_ref()], bump)]
+    #[account(
+        mut,
+        seeds = [owner.key().as_ref()],
+        bump = bet_info.bump,
+        has_one = owner @ ErrorCode::InvalidOwner
+    )]
     pub bet_info: Account<'info, OracleBetInfo>,
 
     pub system_program: Program<'info, System>,
@@ -184,20 +157,22 @@ pub struct JoinCtx<'info> {
 
 #[derive(Accounts)]
 pub struct WinCtx<'info> {
-    /// Player must sign
-    #[account(mut)]
+    #[account(mut, signer)]
     pub player: Signer<'info>,
 
-    /// Owner reference only
-    /// CHECK: read-only reference
-    pub owner: UncheckedAccount<'info>,
+    /// CHECK: owner used only for PDA derivation
+    pub owner: AccountInfo<'info>,
 
-    /// PDA seeded by owner; closed to player on success so entire pot is sent
-    #[account(mut, seeds = [owner.key().as_ref()], bump, close = player)]
+    #[account(
+        mut,
+        seeds = [owner.key().as_ref()],
+        bump = bet_info.bump,
+        has_one = player @ ErrorCode::NotBetPlayer,
+        close = player
+    )]
     pub bet_info: Account<'info, OracleBetInfo>,
 
-    /// Pyth price feed account (AccountInfo because we use pyth SDK loader)
-    /// CHECK: validated at runtime via pyth_sdk_solana load_price_feed_from_account_info
+    /// CHECK: Pyth price account
     pub price_feed: AccountInfo<'info>,
 
     pub system_program: Program<'info, System>,
@@ -205,12 +180,16 @@ pub struct WinCtx<'info> {
 
 #[derive(Accounts)]
 pub struct TimeoutCtx<'info> {
-    /// Owner must sign
-    #[account(mut)]
+    #[account(mut, signer)]
     pub owner: Signer<'info>,
 
-    /// PDA seeded by owner; closed to owner on timeout so entire pot is returned to owner
-    #[account(mut, seeds = [owner.key().as_ref()], bump, close = owner)]
+    #[account(
+        mut,
+        seeds = [owner.key().as_ref()],
+        bump = bet_info.bump,
+        has_one = owner @ ErrorCode::InvalidOwner,
+        close = owner
+    )]
     pub bet_info: Account<'info, OracleBetInfo>,
 
     pub system_program: Program<'info, System>,
@@ -218,34 +197,26 @@ pub struct TimeoutCtx<'info> {
 
 #[error_code]
 pub enum ErrorCode {
-    #[msg("Wager must be greater than zero")]
-    InvalidWager,
-    #[msg("Rate must be greater than zero")]
-    InvalidRate,
-    #[msg("Deadline has already passed")]
-    DeadlinePassed,
-    #[msg("Bet already has a player")]
-    AlreadyJoined,
-    #[msg("Owner cannot join their own bet")]
-    OwnerCannotJoin,
-    #[msg("Not the player for this bet")]
-    NotPlayer,
-    #[msg("Too early to resolve the bet")]
-    TooEarlyToResolve,
-    #[msg("Pyth oracle account is invalid or not a Pyth price account")]
-    InvalidOracleAccount,
-    #[msg("Oracle price is stale")]
-    StalePrice,
-    #[msg("Price condition not met")]
-    ConditionNotMet,
-    #[msg("Owner mismatch")]
+    #[msg("Invalid owner for this bet.")]
     InvalidOwner,
-    #[msg("Integer overflow")]
+    #[msg("Bet already has a player.")]
+    AlreadyJoined,
+    #[msg("Owner cannot join this bet.")]
+    OwnerCannotJoin,
+    #[msg("Invalid wager amount.")]
+    InvalidWagerAmount,
+    #[msg("Overflow.")]
     Overflow,
-    #[msg("Clock unix_timestamp negative")]
-    NegativeTimestamp,
-    #[msg("Invalid oracle data")]
+    #[msg("Not the player who joined this bet.")]
+    NotBetPlayer,
+    #[msg("Too early to resolve the bet.")]
+    TooEarlyToResolve,
+    #[msg("Invalid oracle owner.")]
+    InvalidOracleOwner,
+    #[msg("Invalid oracle data.")]
     InvalidOracleData,
-    #[msg("Owner reference does not match bet owner")]
-    InvalidOwnerReference,
+    #[msg("Oracle price is stale.")]
+    StaleOraclePrice,
+    #[msg("Player did not win.")]
+    PlayerDidNotWin,
 }

@@ -1,13 +1,25 @@
 ## Identified Hallucinations
 
-### Knowledge Conflicting: API Knowledge
+### Context Deviation: Dead Code
 **Description:** 
 
-Unused import HashSet.
+The code declares a variable that is never used, resulting in dead code.
 
 **Code Example:**
 ```rust
-use std::collections::HashSet;
+let initializer_key = ctx.accounts.initializer.key();
+
 ```
 
-**CrystalBLEU similarity: 0.118** 
+### Knowledge Conflicting: API Knowledge
+**Description:** 
+
+Use of deprecated module system_instruction
+
+**Code Example:**
+```rust
+use anchor_lang::solana_program::{program::invoke_signed, system_instruction};
+
+```
+
+**CrystalBLEU similarity: 0.245** 

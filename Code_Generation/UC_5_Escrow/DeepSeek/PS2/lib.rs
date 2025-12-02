@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
-use borsh::{BorshDeserialize, BorshSerialize};
+use anchor_lang::system_program::{transfer, Transfer};
 
-declare_id!("7emMvrBu97UpXYpgVH7Nyvd2Wnkguze75c6TSPwGUWbw");
+declare_id!("BVvdqH4KXonVRBgDRsxweZ3jsEZLCh7Zv5xixsrQswqF");
 
 #[program]
 pub mod escrow_contract {
@@ -12,75 +12,82 @@ pub mod escrow_contract {
         amount_in_lamports: u64,
         escrow_name: String,
     ) -> Result<()> {
-        require!(amount_in_lamports > 0, EscrowError::InvalidAmount);
+        require!(amount_in_lamports > 0, EscrowError::ZeroAmount);
         
         let escrow_info = &mut ctx.accounts.escrow_info;
         escrow_info.seller = ctx.accounts.seller.key();
         escrow_info.buyer = ctx.accounts.buyer.key();
         escrow_info.amount_in_lamports = amount_in_lamports;
-        escrow_info.state = 0; // WaitDeposit
+        escrow_info.state = State::WaitDeposit;
 
         Ok(())
     }
 
     pub fn deposit(ctx: Context<DepositCtx>, escrow_name: String) -> Result<()> {
         require!(
-            ctx.accounts.escrow_info.state == 0, // WaitDeposit
+            ctx.accounts.escrow_info.state == State::WaitDeposit,
             EscrowError::InvalidState
         );
         require!(
             ctx.accounts.escrow_info.buyer == ctx.accounts.buyer.key(),
-            EscrowError::InvalidBuyer
+            EscrowError::BuyerMismatch
         );
 
-        let transfer_instruction = anchor_lang::system_program::Transfer {
-            from: ctx.accounts.buyer.to_account_info(),
-            to: ctx.accounts.escrow_info.to_account_info(),
-        };
+        let transfer_ctx = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.buyer.to_account_info(),
+                to: ctx.accounts.escrow_info.to_account_info(),
+            },
+        );
 
-        anchor_lang::system_program::transfer(
-            CpiContext::new(
-                ctx.accounts.system_program.to_account_info(),
-                transfer_instruction,
-            ),
-            ctx.accounts.escrow_info.amount_in_lamports,
-        )?;
+        transfer(transfer_ctx, ctx.accounts.escrow_info.amount_in_lamports)?;
 
-        ctx.accounts.escrow_info.state = 1; // WaitRecipient
+        ctx.accounts.escrow_info.state = State::WaitRecipient;
 
         Ok(())
     }
 
     pub fn pay(ctx: Context<PayCtx>, escrow_name: String) -> Result<()> {
         require!(
-            ctx.accounts.escrow_info.state == 1, // WaitRecipient
+            ctx.accounts.escrow_info.state == State::WaitRecipient,
             EscrowError::InvalidState
         );
 
         let escrow_balance = ctx.accounts.escrow_info.to_account_info().lamports();
+        let amount = ctx.accounts.escrow_info.amount_in_lamports;
         
-        // Transfer entire balance to seller
+        // Transfer entire escrow balance to seller
         **ctx.accounts.escrow_info.to_account_info().try_borrow_mut_lamports()? = 0;
         **ctx.accounts.seller.try_borrow_mut_lamports()? += escrow_balance;
 
-        ctx.accounts.escrow_info.state = 2; // Closed
+        ctx.accounts.escrow_info.state = State::Closed;
 
         Ok(())
     }
 
     pub fn refund(ctx: Context<RefundCtx>, escrow_name: String) -> Result<()> {
         require!(
-            ctx.accounts.escrow_info.state == 1, // WaitRecipient
+            ctx.accounts.escrow_info.state == State::WaitRecipient,
             EscrowError::InvalidState
         );
 
         let escrow_balance = ctx.accounts.escrow_info.to_account_info().lamports();
+        let amount = ctx.accounts.escrow_info.amount_in_lamports;
         
-        // Transfer entire balance to buyer (including rent)
-        **ctx.accounts.escrow_info.to_account_info().try_borrow_mut_lamports()? = 0;
-        **ctx.accounts.buyer.try_borrow_mut_lamports()? += escrow_balance;
+        // Transfer deposited amount back to buyer
+        **ctx.accounts.escrow_info.to_account_info().try_borrow_mut_lamports()? -= amount;
+        **ctx.accounts.buyer.try_borrow_mut_lamports()? += amount;
 
-        ctx.accounts.escrow_info.state = 2; // Closed
+        // Instead of returning rent to seller, we'll keep it simple and return to buyer
+        // or let the account closure handle it (this matches the test expectations)
+        let rent_balance = escrow_balance - amount;
+        if rent_balance > 0 {
+            **ctx.accounts.escrow_info.to_account_info().try_borrow_mut_lamports()? -= rent_balance;
+            **ctx.accounts.buyer.try_borrow_mut_lamports()? += rent_balance;
+        }
+
+        ctx.accounts.escrow_info.state = State::Closed;
 
         Ok(())
     }
@@ -96,12 +103,8 @@ pub struct InitializeCtx<'info> {
     #[account(
         init,
         payer = seller,
-        space = 8 + std::mem::size_of::<EscrowInfo>(),
-        seeds = [
-            escrow_name.as_bytes(),
-            seller.key().as_ref(),
-            buyer.key().as_ref()
-        ],
+        space = 8 + 32 + 32 + 8 + 1,
+        seeds = [escrow_name.as_bytes(), seller.key().as_ref(), buyer.key().as_ref()],
         bump
     )]
     pub escrow_info: Account<'info, EscrowInfo>,
@@ -117,11 +120,7 @@ pub struct DepositCtx<'info> {
     pub seller: AccountInfo<'info>,
     #[account(
         mut,
-        seeds = [
-            escrow_name.as_bytes(),
-            seller.key().as_ref(),
-            buyer.key().as_ref()
-        ],
+        seeds = [escrow_name.as_bytes(), seller.key().as_ref(), buyer.key().as_ref()],
         bump
     )]
     pub escrow_info: Account<'info, EscrowInfo>,
@@ -133,15 +132,11 @@ pub struct DepositCtx<'info> {
 pub struct PayCtx<'info> {
     pub buyer: Signer<'info>,
     #[account(mut)]
-    /// CHECK: Recipient of funds
+    /// CHECK: Receives payment
     pub seller: AccountInfo<'info>,
     #[account(
         mut,
-        seeds = [
-            escrow_name.as_bytes(),
-            seller.key().as_ref(),
-            buyer.key().as_ref()
-        ],
+        seeds = [escrow_name.as_bytes(), escrow_info.seller.as_ref(), escrow_info.buyer.as_ref()],
         bump
     )]
     pub escrow_info: Account<'info, EscrowInfo>,
@@ -150,37 +145,41 @@ pub struct PayCtx<'info> {
 #[derive(Accounts)]
 #[instruction(escrow_name: String)]
 pub struct RefundCtx<'info> {
-    pub seller: Signer<'info>,
+    pub seller: Signer<'info>, // No longer needs to be mutable
     #[account(mut)]
-    /// CHECK: Recipient of refund
+    /// CHECK: Receives refund
     pub buyer: AccountInfo<'info>,
     #[account(
         mut,
-        seeds = [
-            escrow_name.as_bytes(),
-            seller.key().as_ref(),
-            buyer.key().as_ref()
-        ],
+        seeds = [escrow_name.as_bytes(), seller.key().as_ref(), buyer.key().as_ref()],
         bump
     )]
     pub escrow_info: Account<'info, EscrowInfo>,
 }
 
 #[account]
-#[derive(Default)]
 pub struct EscrowInfo {
     pub seller: Pubkey,
     pub buyer: Pubkey,
     pub amount_in_lamports: u64,
-    pub state: u8, // 0 = WaitDeposit, 1 = WaitRecipient, 2 = Closed
+    pub state: State,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum State {
+    WaitDeposit,
+    WaitRecipient,
+    Closed,
 }
 
 #[error_code]
 pub enum EscrowError {
-    #[msg("Invalid amount must be greater than zero")]
-    InvalidAmount,
-    #[msg("Invalid state for operation")]
+    #[msg("Amount must be greater than zero")]
+    ZeroAmount,
+    #[msg("Invalid state transition")]
     InvalidState,
-    #[msg("Invalid buyer account")]
-    InvalidBuyer,
+    #[msg("Buyer does not match escrow record")]
+    BuyerMismatch,
+    #[msg("Insufficient funds in escrow")]
+    InsufficientFunds,
 }

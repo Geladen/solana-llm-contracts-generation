@@ -1,233 +1,220 @@
 use anchor_lang::prelude::*;
-use sha2::{Digest, Sha256};
-use core::any::type_name;
-
 use anchor_lang::solana_program::{
-    account_info::AccountInfo,
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     system_instruction,
-    sysvar::rent::Rent,
-    pubkey::Pubkey,
 };
+use sha2::{Digest, Sha256};
 
-declare_id!("5dNQdzCh7fbFSa5Gpy3ASZss7uPDQa9dke4TjmyhyE6M");
-
-
-const MIN_PDA_SPACE: usize = 8; // Anchor discriminator only
+declare_id!("2hPuBtgXx6thXdRqkphRTvoz4WdUWibWtkgvFLkqu23e");
 
 #[program]
-pub mod storage {
+pub mod storage_copilot {
     use super::*;
 
-    /// Initialize PDAs if missing. Idempotent.
-    /// Creates minimal accounts (8 bytes) and writes Anchor discriminators.
     pub fn initialize(ctx: Context<InitializeCtx>) -> Result<()> {
-        let program_id = ctx.program_id;
-
-        // STRING PDA
-        {
-            let string_info = ctx.accounts.string_storage_pda.to_account_info();
-            let (derived, bump) = Pubkey::find_program_address(
-                &[b"storage_string", ctx.accounts.user.key.as_ref()],
-                program_id,
-            );
-            require_keys_eq!(derived, *string_info.key);
-
-            if *string_info.owner != *program_id || string_info.data_len() < MIN_PDA_SPACE {
-                let rent = Rent::get()?;
-                let lamports = rent.minimum_balance(MIN_PDA_SPACE);
-
-                let create_ix = system_instruction::create_account(
-                    ctx.accounts.user.key,
-                    string_info.key,
-                    lamports,
-                    MIN_PDA_SPACE as u64,
-                    program_id,
-                );
-
-                invoke_signed(
-                    &create_ix,
-                    &[ctx.accounts.user.to_account_info(), string_info.clone()],
-                    &[&[b"storage_string", ctx.accounts.user.key.as_ref(), &[bump]]],
-                )?;
-
-                // write discriminator
-                let disc = anchor_discriminator::<MemoryStringPDA>();
-                string_info.data.borrow_mut()[..8].copy_from_slice(&disc);
-            }
-        }
-
-        // BYTES PDA
-        {
-            let bytes_info = ctx.accounts.bytes_storage_pda.to_account_info();
-            let (derived, bump) = Pubkey::find_program_address(
-                &[b"storage_bytes", ctx.accounts.user.key.as_ref()],
-                program_id,
-            );
-            require_keys_eq!(derived, *bytes_info.key);
-
-            if *bytes_info.owner != *program_id || bytes_info.data_len() < MIN_PDA_SPACE {
-                let rent = Rent::get()?;
-                let lamports = rent.minimum_balance(MIN_PDA_SPACE);
-
-                let create_ix = system_instruction::create_account(
-                    ctx.accounts.user.key,
-                    bytes_info.key,
-                    lamports,
-                    MIN_PDA_SPACE as u64,
-                    program_id,
-                );
-
-                invoke_signed(
-                    &create_ix,
-                    &[ctx.accounts.user.to_account_info(), bytes_info.clone()],
-                    &[&[b"storage_bytes", ctx.accounts.user.key.as_ref(), &[bump]]],
-                )?;
-
-                // write discriminator
-                let disc = anchor_discriminator::<MemoryBytesPDA>();
-                bytes_info.data.borrow_mut()[..8].copy_from_slice(&disc);
-            }
-        }
-
         Ok(())
     }
 
-    /// Store a String into the user's string PDA. Requires user signature.
-    /// If PDA too small, top up from user and allocate to new size, then write serialized struct at offset 8.
     pub fn store_string(ctx: Context<StoreStringCtx>, data_to_store: String) -> Result<()> {
-        let body = MemoryStringPDA { my_string: data_to_store };
-        let body_serialized = body.try_to_vec().map_err(|_| error!(ErrorCode::SerializeFail))?;
-        let required_len = 8usize + body_serialized.len();
+        // 1) Update typed account so try_serialize on Account<> reflects intended state.
+        ctx.accounts.string_storage_pda.my_string = data_to_store.clone();
 
-        let user_info = ctx.accounts.user.to_account_info().clone();
-        let pda_info = ctx.accounts.string_storage_pda.to_account_info().clone();
+        // 2) Serialize the concrete Account<> (Anchor AccountSerialize) to compute exact payload.
+        let mut payload: Vec<u8> = Vec::new();
+        ctx.accounts
+            .string_storage_pda
+            .try_serialize(&mut payload)?; // Borsh payload (no discriminator)
 
-        let (_pda_key, bump) = Pubkey::find_program_address(
+        // 3) Compute required size (discriminator + payload)
+        let required_size = discriminator_len() + payload.len();
+
+        // 4) Derive bump and build signer seeds (include bump)
+        let (_pda, bump) = Pubkey::find_program_address(
             &[b"storage_string", ctx.accounts.user.key.as_ref()],
             ctx.program_id,
         );
-        let seeds: &[&[u8]] = &[
-            b"storage_string",
-            ctx.accounts.user.key.as_ref(),
-            &[bump],
-        ];
+        let bump_slice = &[bump];
+        let seeds: [&[u8]; 3] = [b"storage_string", ctx.accounts.user.key.as_ref(), bump_slice];
+        let signer_seeds: &[&[u8]] = &seeds;
 
-        if pda_info.data_len() < required_len {
-            resize_account_with_topup(user_info.clone(), pda_info.clone(), required_len, seeds)?;
-        }
+        // 5) Resize & manage lamports (fund before realloc for growth)
+        perform_realloc_and_rent_management(
+            &mut ctx.accounts.string_storage_pda.to_account_info(),
+            &ctx.accounts.user.to_account_info(),
+            signer_seeds,
+            required_size,
+        )?;
 
-        let mut data = pda_info.data.borrow_mut();
-        data[8..8 + body_serialized.len()].copy_from_slice(&body_serialized);
-
-        // Update in-memory Anchor account for remainder of instruction
-        ctx.accounts.string_storage_pda.my_string = body.my_string;
+        // 6) Write discriminator + payload into account buffer
+        write_account_data_and_clear_rest(
+            &mut ctx.accounts.string_storage_pda.to_account_info(),
+            "MemoryStringPDA",
+            &payload,
+        )?;
 
         Ok(())
     }
 
-    /// Store bytes into the user's bytes PDA. Requires user signature.
     pub fn store_bytes(ctx: Context<StoreBytesCtx>, data_to_store: Vec<u8>) -> Result<()> {
-        let body = MemoryBytesPDA { my_bytes: data_to_store };
-        let body_serialized = body.try_to_vec().map_err(|_| error!(ErrorCode::SerializeFail))?;
-        let required_len = 8usize + body_serialized.len();
+        // 1) Update typed account
+        ctx.accounts.bytes_storage_pda.my_bytes = data_to_store.clone();
 
-        let user_info = ctx.accounts.user.to_account_info().clone();
-        let pda_info = ctx.accounts.bytes_storage_pda.to_account_info().clone();
+        // 2) Serialize Account<> payload
+        let mut payload: Vec<u8> = Vec::new();
+        ctx.accounts
+            .bytes_storage_pda
+            .try_serialize(&mut payload)?;
 
-        let (_pda_key, bump) = Pubkey::find_program_address(
+        // 3) Required size
+        let required_size = discriminator_len() + payload.len();
+
+        // 4) Derive bump and signer seeds
+        let (_pda, bump) = Pubkey::find_program_address(
             &[b"storage_bytes", ctx.accounts.user.key.as_ref()],
             ctx.program_id,
         );
-        let seeds: &[&[u8]] = &[
-            b"storage_bytes",
-            ctx.accounts.user.key.as_ref(),
-            &[bump],
-        ];
+        let bump_slice = &[bump];
+        let seeds: [&[u8]; 3] = [b"storage_bytes", ctx.accounts.user.key.as_ref(), bump_slice];
+        let signer_seeds: &[&[u8]] = &seeds;
 
-        if pda_info.data_len() < required_len {
-            resize_account_with_topup(user_info.clone(), pda_info.clone(), required_len, seeds)?;
-        }
+        // 5) Resize & rent management
+        perform_realloc_and_rent_management(
+            &mut ctx.accounts.bytes_storage_pda.to_account_info(),
+            &ctx.accounts.user.to_account_info(),
+            signer_seeds,
+            required_size,
+        )?;
 
-        let mut data = pda_info.data.borrow_mut();
-        data[8..8 + body_serialized.len()].copy_from_slice(&body_serialized);
-
-        ctx.accounts.bytes_storage_pda.my_bytes = body.my_bytes;
+        // 6) Write discriminator + payload and zero any remaining bytes
+        write_account_data_and_clear_rest(
+            &mut ctx.accounts.bytes_storage_pda.to_account_info(),
+            "MemoryBytesPDA",
+            &payload,
+        )?;
 
         Ok(())
     }
 }
 
-/// Resize a program-owned account to new_len, preserving the 8-byte Anchor discriminator.
-/// If the account lacks lamports for rent-exemption at new_len, transfer the exact difference from payer first.
-fn resize_account_with_topup<'a>(
-    payer: AccountInfo<'a>,
-    target: AccountInfo<'a>,
-    new_len: usize,
-    seeds: &[&[u8]],
-) -> Result<()> {
-    let rent = Rent::get()?;
-    let current_len = target.data_len();
-    if new_len == current_len {
-        return Ok(());
-    }
-
-    let required_lamports = rent.minimum_balance(new_len);
-    let current_lamports = **target.lamports.borrow();
-
-    if current_lamports < required_lamports {
-        let diff = required_lamports - current_lamports;
-        let transfer_ix = system_instruction::transfer(payer.key, target.key, diff);
-
-        // payer signs transfer
-        invoke_signed(
-            &transfer_ix,
-            &[payer.clone(), target.clone()],
-            &[],
-        ).map_err(|_| error!(ErrorCode::LamportTopupFailed))?;
-    }
-
-    // allocate (realloc) to new size; PDA signs with seeds
-    let allocate_ix = system_instruction::allocate(target.key, new_len as u64);
-    invoke_signed(
-        &allocate_ix,
-        &[target.clone()],
-        &[seeds],
-    ).map_err(|_| error!(ErrorCode::ReallocFailed))?;
-
-    Ok(())
+fn discriminator_len() -> usize {
+    8usize
 }
 
-/// Compute Anchor 8-byte discriminator for an account type T:
-/// first 8 bytes of SHA256("account:<TypeName>")
-fn anchor_discriminator<T>() -> [u8; 8] {
-    let full = type_name::<T>();
-    let short = full.rsplit("::").next().unwrap_or(full);
-    let label = format!("account:{}", short);
-    let hash = Sha256::digest(label.as_bytes());
+/// Compute Anchor-style 8-byte discriminator for "account:<StructName>"
+fn anchor_discriminator_for(name: &str) -> [u8; 8] {
+    let full = format!("account:{}", name);
+    let mut hasher = Sha256::new();
+    hasher.update(full.as_bytes());
+    let hash = hasher.finalize();
     let mut disc = [0u8; 8];
     disc.copy_from_slice(&hash[..8]);
     disc
 }
 
+/// Write discriminator + payload into the account's data buffer and zero any remaining bytes.
+/// This guarantees no stale bytes remain from previous larger writes.
+fn write_account_data_and_clear_rest<'info>(
+    ai: &mut AccountInfo<'info>,
+    account_name: &str,
+    payload: &[u8],
+) -> Result<()> {
+    let total_payload_len = discriminator_len() + payload.len();
+    let buffer_len = ai.data_len();
+    if buffer_len < total_payload_len {
+        return err!(ErrorCode::InsufficientAccountData);
+    }
+
+    let disc = anchor_discriminator_for(account_name);
+
+    // Write discriminator and payload
+    {
+        let mut data = ai.data.borrow_mut();
+        data[..8].copy_from_slice(&disc);
+        data[8..8 + payload.len()].copy_from_slice(payload);
+
+        // Zero any remaining bytes after the written payload up to buffer_len
+        if buffer_len > total_payload_len {
+            for b in data[8 + payload.len()..buffer_len].iter_mut() {
+                *b = 0u8;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Realloc + rent management:
+/// - Grow: fund PDA from payer first (payer signs transaction), then realloc
+/// - Shrink: refund excess lamports from PDA -> payer via invoke_signed (PDA signs), then realloc
+fn perform_realloc_and_rent_management<'info>(
+    pda_ai: &mut AccountInfo<'info>,
+    payer_ai: &AccountInfo<'info>,
+    signer_seeds: &[&[u8]],
+    required_size: usize,
+) -> Result<()> {
+    let rent = Rent::get()?;
+    let current_len = pda_ai.data_len();
+    if required_size == current_len {
+        return Ok(());
+    }
+
+    let required_rent = rent.minimum_balance(required_size);
+    let current_lamports = **pda_ai.lamports.borrow();
+
+    if required_size > current_len {
+        // Fund PDA from payer (payer signs) before realloc
+        if current_lamports < required_rent {
+            let diff = required_rent - current_lamports;
+            invoke(
+                &system_instruction::transfer(payer_ai.key, pda_ai.key, diff),
+                &[payer_ai.clone(), pda_ai.clone()],
+            )?;
+        }
+
+        // Then increase data size
+        pda_ai.realloc(required_size, false)?;
+    } else {
+        // Shrink: refund excess lamports from PDA -> payer using PDA-signed CPI
+        if current_lamports > required_rent {
+            let excess = current_lamports - required_rent;
+            invoke_signed(
+                &system_instruction::transfer(pda_ai.key, payer_ai.key, excess),
+                &[pda_ai.clone(), payer_ai.clone()],
+                &[signer_seeds],
+            )?;
+        }
+
+        // Then shrink
+        pda_ai.realloc(required_size, false)?;
+    }
+
+    Ok(())
+}
+
 #[derive(Accounts)]
+#[instruction()]
 pub struct InitializeCtx<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
-    /// CHECK: This AccountInfo may not exist yet; initialize creates the PDA, assigns it to the program,
-    /// and writes the Anchor discriminator. We use raw AccountInfo here because Anchor cannot type-check
-    /// an account that doesn't exist yet. After initialize returns the account will be program-owned and
-    /// fetchable as a typed Account in subsequent instructions.
-    #[account(mut)]
-    pub string_storage_pda: AccountInfo<'info>,
+    /// Create if missing; payer = user
+    #[account(
+        init_if_needed,
+        payer = user,
+        space = 8 + 4 + 0, // discriminator + length prefix + zero bytes
+        seeds = [b"storage_string", user.key.as_ref()],
+        bump
+    )]
+    pub string_storage_pda: Account<'info, MemoryStringPDA>,
 
-    /// CHECK: This AccountInfo may not exist yet; initialize creates the PDA, assigns it to the program,
-    /// and writes the Anchor discriminator. We use raw AccountInfo here because Anchor cannot type-check
-    /// an account that doesn't exist yet. After initialize returns the account will be program-owned and
-    /// fetchable as a typed Account in subsequent instructions.
-    #[account(mut)]
-    pub bytes_storage_pda: AccountInfo<'info>,
+    #[account(
+        init_if_needed,
+        payer = user,
+        space = 8 + 4 + 0, // discriminator + length prefix + zero bytes
+        seeds = [b"storage_bytes", user.key.as_ref()],
+        bump
+    )]
+    pub bytes_storage_pda: Account<'info, MemoryBytesPDA>,
 
     pub system_program: Program<'info, System>,
 }
@@ -237,8 +224,11 @@ pub struct StoreStringCtx<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
-    /// After initialize, this will be a typed account. We require mut because we'll update it in-memory.
-    #[account(mut)]
+    #[account(
+        mut,
+        seeds = [b"storage_string", user.key.as_ref()],
+        bump,
+    )]
     pub string_storage_pda: Account<'info, MemoryStringPDA>,
 
     pub system_program: Program<'info, System>,
@@ -249,30 +239,28 @@ pub struct StoreBytesCtx<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
-    #[account(mut)]
+    #[account(
+        mut,
+        seeds = [b"storage_bytes", user.key.as_ref()],
+        bump,
+    )]
     pub bytes_storage_pda: Account<'info, MemoryBytesPDA>,
 
     pub system_program: Program<'info, System>,
 }
 
 #[account]
-#[derive(Default)]
 pub struct MemoryStringPDA {
     pub my_string: String,
 }
 
 #[account]
-#[derive(Default)]
 pub struct MemoryBytesPDA {
     pub my_bytes: Vec<u8>,
 }
 
 #[error_code]
 pub enum ErrorCode {
-    #[msg("Failed to serialize account data")]
-    SerializeFail,
-    #[msg("Lamport top-up transfer failed")]
-    LamportTopupFailed,
-    #[msg("Reallocation (allocate) instruction failed")]
-    ReallocFailed,
+    #[msg("Account data buffer is smaller than expected for write.")]
+    InsufficientAccountData,
 }

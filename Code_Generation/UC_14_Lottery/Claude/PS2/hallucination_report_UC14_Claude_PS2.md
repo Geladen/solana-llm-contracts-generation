@@ -3,12 +3,13 @@
 ### Knowledge Conflicting: API Knowledge
 **Description:** 
 
-The code imports BorshSerialize but never actually utilizes it in the implementation.
+The program uses the deprecated module system_instruction and includes an unused import anchor_lang::system_program.
 
 **Code Example:**
 ```rust
-use borsh::{BorshDeserialize, BorshSerialize};
-
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{keccak, system_instruction};
+use anchor_lang::system_program;
 ```
 
-**CrystalBLEU similarity: 0.313** 
+**CrystalBLEU similarity: 0.293** 

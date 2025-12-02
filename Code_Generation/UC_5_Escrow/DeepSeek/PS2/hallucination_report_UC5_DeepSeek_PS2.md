@@ -7,11 +7,7 @@ The escrow_name parameter is declared in multiple function signatures but never 
 
 **Code Example:**
 ```rust
-    pub fn initialize(
-        ctx: Context<InitializeCtx>,
-        amount_in_lamports: u64,
-        escrow_name: String,
-    ) -> Result<()> {
+pub fn deposit(ctx: Context<DepositCtx>, escrow_name: String) -> Result<()> {
 ```
 
-**CrystalBLEU similarity: 0.342** 
+**CrystalBLEU similarity: 0.365** 

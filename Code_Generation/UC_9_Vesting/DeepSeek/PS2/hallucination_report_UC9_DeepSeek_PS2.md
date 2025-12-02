@@ -1,14 +1,12 @@
 ## Identified Hallucinations
 
-### Context Deviation: Dead Code
+### Context Deviation: Inconsistency
 **Description:** 
 
-The code declares a variable that is never used, resulting in dead code.
+Funds distribution error at vesting completion.
 
 **Code Example:**
 ```rust
-let current_balance = vesting_account_info.lamports();
-
 ```
 
-**CrystalBLEU similarity: 0.272** 
+**CrystalBLEU similarity: 0.195** 

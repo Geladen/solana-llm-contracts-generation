@@ -3,14 +3,16 @@
 ### Context Devition: Dead Code
 **Description:** 
 
-The code declares wallet_pda that is never used, resulting in dead code.
+The transaction_seed parameter is declared in the function signature but never utilized within the function's logic.
 
 **Code Example:**
 ```rust
-let wallet_pda = &ctx.accounts.user_wallet_pda;
+pub fn create_transaction(
+        ctx: Context<CreateTransactionCtx>,
+        transaction_seed: String,
+        transaction_lamports_amount: u64,
+    ) -> Result<()> {
+        require!(transaction_lamports_amount > 0, WalletError::InvalidAmount);
 ```
 
-**CrystalBLEU similarity: 0.229** 
-
-
-
+**CrystalBLEU similarity: 0.314** 

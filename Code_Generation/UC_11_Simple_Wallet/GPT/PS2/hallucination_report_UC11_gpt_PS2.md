@@ -7,14 +7,22 @@ The transaction_seed parameter is declared in the function signature but never u
 
 **Code Example:**
 ```rust
-// Create a pending transaction PDA
 pub fn create_transaction(
-    ctx: Context<CreateTransactionCtx>,
-    transaction_seed: String,
-    transaction_lamports_amount: u64,
-) -> Result<()> {
-    let transaction = &mut ctx.accounts.transaction_pda;
+        ctx: Context<CreateTransactionCtx>,
+        transaction_seed: String,
+        transaction_lamports_amount: u64,
+    ) -> Result<()> {
+        require!(transaction_lamports_amount > 0, WalletError::InvalidAmount);
 ```
 
-**CrystalBLEU similarity: 0.343** 
+### Knowledge Conflicting: API Knowledge
+**Description:** 
 
+The code uses a deprecated import.
+
+**Code Example:**
+```rust
+use anchor_lang::solana_program::{system_instruction, program as sol_program};
+```
+
+**CrystalBLEU similarity: 0.383** 

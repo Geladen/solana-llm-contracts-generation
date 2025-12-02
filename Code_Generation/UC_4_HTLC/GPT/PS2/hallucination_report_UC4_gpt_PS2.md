@@ -3,10 +3,10 @@
 ### Intent Conflicting
 **Description:** 
 
-The contract does not follow the prompt's specific directives regarding the data structure.
+The contract fails to transfer the specified HTLC amount during initialization, deviating from the user's deposit intent.
 
 **Code Example:**
 ```rust
 ```
 
-**CrystalBLEU similarity: 0.187** 
+**CrystalBLEU similarity: 0.311** 

@@ -1,28 +1,29 @@
 ## Identified Hallucinations
 
-### Knowledge Conflicting
+### Intent Conflicting
 **Description:** 
 
-PDA cannot be authority for ATA creation - violates Anchor token constraints
+Declared ownership transfer intent never implemented
 
 **Code Example:**
 ```rust
-authority: ctx.accounts.atas_holder_pda.to_account_info(),
+/// CHECK: PDA that will own the temporary token account  
 ```
 
 ### Context Deviation: Inconsistency
 **Description:** 
 
-Account marked mutable but creation fails, leaving it uninitialized
+Token authority constraint mismatches actual account ownership
 
 **Code Example:**
 ```rust
 #[account(
     mut,
-    associated_token::mint = mint,
-    associated_token::authority = atas_holder_pda
+    token::mint = mint,
+    token::authority = atas_holder_pda
 )]
-pub pda_temp_ata: Account<'info, TokenAccount>,
+pub temp_ata: Account<'info, TokenAccount>,
 ```
 
-**CrystalBLEU similarity: 0.216** 
+
+**CrystalBLEU similarity: 0.326** 
