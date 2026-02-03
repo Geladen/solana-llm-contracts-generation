@@ -1,0 +1,3 @@
+crystalbleu==0.2
+lizard==1.21.0
+nltk==3.9.2
